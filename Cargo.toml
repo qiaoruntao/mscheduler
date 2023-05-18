@@ -1,0 +1,16 @@
+[package]
+name = "mscheduler"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0"
+mongodb = { version = "2", features = [] }
+serde = "1"
+tokio = { version = "1", features = ["signal"] }
+tracing = { version = "0", features = ["log"] }
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
