@@ -11,7 +11,7 @@ mod test {
 
     #[tokio::test]
     async fn test_send_new_task() {
-        let collection = get_collection().await;
+        let collection = get_collection("test_send_new_task").await;
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
@@ -27,7 +27,7 @@ mod test {
 
     #[tokio::test]
     async fn test_send_duplicate_task() {
-        let collection = get_collection().await;
+        let collection = get_collection("test_send_duplicate_task").await;
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
@@ -66,7 +66,7 @@ mod test {
         assert_eq!(task.key, key);
     }
 
-    async fn get_collection() -> Collection<Task<i32, i32>> {
+    async fn get_collection(collection_name: impl AsRef<str>) -> Collection<Task<i32, i32>> {
         let connection_str = env::var("MongoStr").expect("need mongodb connection str");
         let client_options = if cfg!(windows) && connection_str.contains("+srv") {
             ClientOptions::parse_with_resolver_config(connection_str, ResolverConfig::quad9()).await.unwrap()
@@ -77,7 +77,7 @@ mod test {
         // Get a handle to the deployment.
         let client = Client::with_options(client_options).unwrap();
         let database = client.database(target_database.as_str());
-        let collection = database.collection::<Task<i32, i32>>("test");
+        let collection = database.collection::<Task<i32, i32>>(collection_name.as_ref());
         collection
     }
 }

@@ -1,3 +1,14 @@
+[![Crates.io][crates-badge]][crates-url]
+[![MIT licensed][mit-badge]][mit-url]
+[![Build Status][actions-badge]][actions-url]
+
+[crates-badge]: https://img.shields.io/crates/v/tokio.svg
+[crates-url]: https://crates.io/crates/tokio
+[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
+[mit-url]: https://github.com/qiaoruntao/mscheduler/blob/master/LICENSE
+[actions-badge]: https://github.com/qiaoruntao/mscheduler/actions/workflows/ci.yml/badge.svg
+[actions-url]: https://github.com/qiaoruntao/mscheduler/actions?query=branch%3Amaster
+
 | Feature                    |      Bull       | Agenda |
 |:---------------------------|:---------------:|:------:|
 | Backend                    |      redis      | mongo  |
