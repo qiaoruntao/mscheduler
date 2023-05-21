@@ -15,8 +15,8 @@ jobs:
       matrix:
         toolchain:
           - stable
-#          - beta
-#          - nightly
+        #          - beta
+        #          - nightly
         mongodb-version: [ '6.0' ]
     steps:
       - uses: actions/checkout@v3
@@ -25,8 +25,12 @@ jobs:
         with:
           mongodb-version: ${{ matrix.mongodb-version }}
           mongodb-replica-set: rs1
-#      - run: mongodb --eval "db.serverStatus()"
-      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - run: cargo build --verbose
-      - run: cargo test --verbose
-
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Install Rust
+        run: rustup update stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test mscheduler all features
+        run: cargo test --all-features
