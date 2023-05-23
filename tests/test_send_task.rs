@@ -1,13 +1,13 @@
-mod test {
-    use std::env;
+mod common;
 
-    use mongodb::{Client, Collection};
+#[cfg(test)]
+mod test {
     use mongodb::bson::{DateTime, doc};
-    use mongodb::options::{ClientOptions, ResolverConfig};
 
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
-    use mscheduler::tasker::task::Task;
     use mscheduler::tasker::task_common::ensure_index;
+
+    use crate::common::get_collection;
 
     #[tokio::test]
     async fn test_send_new_task() {
@@ -64,20 +64,5 @@ mod test {
         assert!(task.params.is_some());
         assert_eq!(task.task_state.start_time, run_time);
         assert_eq!(task.key, key);
-    }
-
-    async fn get_collection(collection_name: impl AsRef<str>) -> Collection<Task<i32, i32>> {
-        let connection_str = env::var("MongoStr").expect("need mongodb connection str");
-        let client_options = if cfg!(windows) && connection_str.contains("+srv") {
-            ClientOptions::parse_with_resolver_config(connection_str, ResolverConfig::quad9()).await.unwrap()
-        } else {
-            ClientOptions::parse(connection_str).await.unwrap()
-        };
-        let target_database = client_options.default_database.clone().unwrap();
-        // Get a handle to the deployment.
-        let client = Client::with_options(client_options).unwrap();
-        let database = client.database(target_database.as_str());
-        let collection = database.collection::<Task<i32, i32>>(collection_name.as_ref());
-        collection
     }
 }

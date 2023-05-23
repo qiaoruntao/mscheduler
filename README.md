@@ -100,3 +100,7 @@
 核心问题: 下一次什么时候去占用任务
 1. 启动时计算下一次时间next_try_time
 2. 使用change_stream实时更新next_try_time 
+
+## TODO
+-[ ] clean_success 暂不实现, maintenance
+-[ ] clean_failed 暂不实现, maintenance

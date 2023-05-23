@@ -17,9 +17,9 @@ pub struct SendTaskOption {
     // specific a custom task start time
     pub run_time: Option<DateTime>,
     // clean up existing task's success worker states
-    pub clean_success: bool,
+    // pub clean_success: bool,
     // clean up existing task's failed worker states
-    pub clean_failed: bool,
+    // pub clean_failed: bool,
     // TODO: more options in task_option
 }
 
@@ -28,8 +28,8 @@ impl Default for SendTaskOption {
         SendTaskOption {
             update_existing_params: false,
             run_time: None,
-            clean_success: false,
-            clean_failed: false,
+            // clean_success: false,
+            // clean_failed: false,
         }
     }
 }
