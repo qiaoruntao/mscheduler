@@ -4,7 +4,7 @@ use mongodb::options::UpdateOptions;
 use serde::Serialize;
 
 use crate::tasker::error::{MResult, MSchedulerError};
-use crate::tasker::task::{Task, TaskOption, TaskState};
+use crate::tasker::task::{Task, TaskOption};
 
 pub struct TaskProducer<T, K> {
     task_collection: Collection<Task<T, K>>,
@@ -47,17 +47,12 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
     }
 
     /// send a task
-    pub async fn send_task(&self, key: impl AsRef<str>, params: Option<T>, option: Option<SendTaskOption>) -> MResult<SendTaskResult> {
+    pub async fn send_task(&self, key: impl AsRef<str>, params: T, option: Option<SendTaskOption>) -> MResult<SendTaskResult> {
         let send_option = option.unwrap_or_default();
 
         let query = doc! { "key": key.as_ref()};
         let now = DateTime::now();
         let start_time = send_option.run_time.clone().unwrap_or(now);
-        let task_state = TaskState {
-            create_time: now,
-            start_time,
-            worker_states: vec![],
-        };
         let task_option = TaskOption {
             priority: 0,
             concurrent_worker_cnt: 1,
@@ -115,7 +110,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
                 }
             }
             Err(e) => {
-                Err(MSchedulerError::MongoDbError(e))
+                Err(MSchedulerError::MongoDbError(e.into()))
             }
         }
     }

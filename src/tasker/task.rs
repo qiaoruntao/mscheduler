@@ -2,7 +2,7 @@ use mongodb::bson::DateTime;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
-pub struct TaskWorkerState {
+pub struct TaskWorkerState<K> {
     // worker identifier
     pub worker_id: String,
     // how many unexpected retry has occurred
@@ -13,16 +13,18 @@ pub struct TaskWorkerState {
     pub success_time: Option<DateTime>,
     // when did this task failed
     pub fail_time: Option<DateTime>,
+    // task return values
+    pub returns: Option<K>,
 }
 
 #[derive(Deserialize, Serialize)]
-pub struct TaskState {
+pub struct TaskState<K> {
     // when did this task created
     pub create_time: DateTime,
     // when should this task run
     pub start_time: DateTime,
     // worker ids of which are running this task
-    pub worker_states: Vec<TaskWorkerState>,
+    pub worker_states: Vec<TaskWorkerState<K>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -50,11 +52,9 @@ pub struct Task<T, K> {
     // identifier
     pub key: String,
     // record task running state
-    pub task_state: TaskState,
+    pub task_state: TaskState<K>,
     // task running options
     pub task_option: TaskOption,
     // task parameters
     pub params: Option<T>,
-    // task return values
-    pub returns: Option<K>,
 }

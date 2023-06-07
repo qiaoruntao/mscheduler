@@ -1,24 +1,30 @@
+use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration};
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::future::Join;
+use futures::{FutureExt, StreamExt};
 use mongodb::bson::{DateTime, doc, Document, from_document};
 use mongodb::change_stream::ChangeStream;
 use mongodb::change_stream::event::ChangeStreamEvent;
 use mongodb::Collection;
-use mongodb::options::{ChangeStreamOptions, FullDocumentType};
+use mongodb::options::{ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::tasker::error::{MResult, MSchedulerError};
 use crate::tasker::task::Task;
 
 #[async_trait]
-pub trait TaskConsumerFunc<T, K> {
-    async fn consumer(&self, params: T) -> MResult<K>;
+pub trait TaskConsumerFunc<T: Send, K: Send>: Send + Sync + 'static {
+    async fn consumer(&self, params: Option<T>) -> MResult<K>;
 }
 
 #[derive(Deserialize)]
@@ -31,11 +37,36 @@ pub struct TaskConsumerConfig {
     allow_consume: bool,
 }
 
-pub struct TaskConsumer<T, K, Func: TaskConsumerFunc<T, K>> {
+
+pub struct TaskState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
+    arc: Arc<Func>,
+    params: Option<T>,
+    handler: JoinHandle<MResult<K>>,
+}
+
+impl<T: Send + Clone + 'static, K: Send + 'static, Func: TaskConsumerFunc<T, K>> TaskState<T, K, Func> {
+    pub fn run(arc: Arc<Func>, params: Option<T>) -> TaskState<T, K, Func> {
+        let handler = tokio::spawn({
+            let arc = arc.clone();
+            let params = params.clone();
+            async move {
+                arc.consumer(params).await
+            }
+        });
+        TaskState {
+            arc,
+            params,
+            handler,
+        }
+    }
+}
+
+pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     marker: PhantomData<Task<T, K>>,
     collection: Collection<Task<T, K>>,
-    func: Func,
+    func: Arc<Func>,
     queue: DelayQueue<String>,
+    task_map: HashMap<String, TaskState<T, K, Func>>,
 }
 
 #[derive(Deserialize)]
@@ -44,17 +75,17 @@ struct NextDoc {
     pub start_time: DateTime,
 }
 
-impl<T: DeserializeOwned + Send + Unpin + Sync, K: DeserializeOwned + Send + Unpin + Sync, Func: TaskConsumerFunc<T, K>> TaskConsumer<T, K, Func> {
+impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send> TaskConsumer<T, K, Func> {
     pub async fn create(collection: Collection<Task<T, K>>, func: Func) -> MResult<Self> {
         let consumer = TaskConsumer {
             marker: Default::default(),
             collection,
-            func,
+            func: Arc::new(func),
             queue: Default::default(),
+            task_map: Default::default(),
         };
         Ok(consumer)
     }
-    pub async fn update_config(&self, config: TaskConsumerConfig) {}
 
     pub fn add2queue(&mut self, key: String, run_time: DateTime) {
         let diff = run_time.timestamp_millis() - DateTime::now().timestamp_millis();
@@ -103,8 +134,130 @@ impl<T: DeserializeOwned + Send + Unpin + Sync, K: DeserializeOwned + Send + Unp
                     }
                 }
             }
-            Some(e)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
-                dbg!(&e);
+            Some(expired)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
+                self.try_occupy_task(expired).await
+            }
+        }
+    }
+
+    pub fn is_task_running(&self, key: impl AsRef<str>) -> bool {
+        self.task_map.contains_key(key.as_ref())
+    }
+
+    async fn try_occupy_task(&mut self, expired: Expired<String>) {
+        let deadline = expired.deadline();
+        let key = expired.get_ref();
+        if deadline + Duration::from_secs(100) < Instant::now() {
+            warn!("task key {} expired long ago", key);
+            return;
+        }
+        // otherwise we try to occupy this task
+        match self.occupy_task(key).await {
+            Ok(task) => {
+                // save task state and run it
+                let params = task.params.clone();
+                let arc = self.func.clone();
+                let task_state = TaskState::run(arc, params);
+                self.task_map.insert(task.key.clone(), task_state);
+            }
+            Err(MSchedulerError::MongoDbError(e)) => {
+                error!("failed to occupy task error={}",e);
+            }
+            Err(_) => {
+                // ignore normal errors
+            }
+        }
+    }
+
+    async fn occupy_task(&mut self, key: impl AsRef<str>) -> MResult<Task<T, K>> {
+        let worker_id = "";
+        let filter = doc! {
+                "$and":[
+                // check for certain key
+                doc!{
+                    "key":key.as_ref()
+                },
+                // check worker version
+                doc! {
+                    "$or": [
+                        doc! { "task_option.min_worker_version": doc!{ "$exists": false } },
+                        doc!{ "task_option.min_worker_version": doc!{ "$lt": 111 } },
+                    ]
+                },
+                // check specific worker
+                doc!{
+                    "$or": [
+                        doc!{ "task_option.specific_worker_ids": doc!{ "$exists": false } },
+                        doc!{ "task_option.specific_worker_ids": doc!{ "$size": 0 } },
+                        doc!{ "task_option.specific_worker_ids": worker_id },
+                    ]
+                },
+                // check not already occupied by self
+                doc!{
+                    "$nor": [doc!{
+                        "task_state.worker_states": doc!{
+                            "$elemMatch": doc!{
+                                "worker_id": worker_id,
+                                "ping_expire_time": doc!{ "$gt": "$$NOW" }
+                            }
+                        }
+                    }]
+                },
+                // check worker count
+                doc!{
+                    "$or": [
+                        doc!{ "task_state.worker_states": doc!{ "$size": 0 } },
+                        // optimize for only one worker condition
+                        doc!{
+                            "$expr": doc!{
+                                "$lt": [doc!{
+                                    "$size": doc!{
+                                        "$filter": doc!{
+                                            "input": "$task_state.worker_states",
+                                            "as": "item",
+                                            "cond": doc!{ "$gt": ["$$item.ping_expire_time", "$$NOW"] }
+                                        }
+                                    }
+                                }, "$task_option.concurrent_worker_cnt"]
+                            }
+                        },
+                    ]
+                }
+            ]
+            };
+        let update = vec![doc! {
+            "$set": doc!{
+                "a": "",
+                "task_state.worker_states": doc!{
+                    "$concatArrays": [doc!{
+                        "$filter": doc!{
+                            "input": "$task_state.worker_states",
+                            "as": "item",
+                            "cond": doc!{ "$gt": ["$$item.ping_expire_time", "$$NOW"] }
+                        }
+                    }, [doc!{
+                        "worker_id": worker_id,
+                        "unexpected_retry_cnt": 0,
+                        "ping_expire_time": "$$NOW",
+                    }]]
+                }
+            }
+        }];
+        let mut update_options = FindOneAndUpdateOptions::default();
+        update_options.sort = Some(doc! {"task_option.priority": -1});
+        update_options.return_document = Some(ReturnDocument::After);
+        // update_options.projection = Some(doc! {"task_state": 1});
+        match self.collection.find_one_and_update(
+            filter, update, Some(update_options),
+        ).await {
+            Ok(Some(task)) => {
+                Ok(task)
+            }
+            Ok(None) => {
+                Err(MSchedulerError::NoTaskAvailable)
+            }
+            Err(e) => {
+                Err(MSchedulerError::MongoDbError(e.into()))
             }
         }
     }
@@ -131,7 +284,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync, K: DeserializeOwned + Send + Unp
                 Ok(v)
             }
             Err(e) => {
-                Err(MSchedulerError::MongoDbError(e))
+                Err(MSchedulerError::MongoDbError(e.into()))
             }
         }
     }
