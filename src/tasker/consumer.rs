@@ -13,6 +13,7 @@ use mongodb::Collection;
 use mongodb::options::{ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::time::delay_queue::Expired;
@@ -45,12 +46,14 @@ pub struct TaskState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
 }
 
 impl<T: Send + Clone + 'static, K: Send + 'static, Func: TaskConsumerFunc<T, K>> TaskState<T, K, Func> {
-    pub fn run(arc: Arc<Func>, params: Option<T>) -> TaskState<T, K, Func> {
+    pub fn run(arc: Arc<Func>, params: Option<T>, sender: Sender<String>, key: String) -> TaskState<T, K, Func> {
         let handler = tokio::spawn({
             let arc = arc.clone();
             let params = params.clone();
             async move {
-                arc.consumer(params).await
+                let result = arc.consumer(params).await;
+                sender.send(key).await;
+                result
             }
         });
         TaskState {
@@ -67,6 +70,8 @@ pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     func: Arc<Func>,
     queue: DelayQueue<String>,
     task_map: HashMap<String, TaskState<T, K, Func>>,
+    sender: Sender<String>,
+    receiver: Receiver<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,12 +82,15 @@ struct NextDoc {
 
 impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send> TaskConsumer<T, K, Func> {
     pub async fn create(collection: Collection<Task<T, K>>, func: Func) -> MResult<Self> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(10);
         let consumer = TaskConsumer {
             marker: Default::default(),
             collection,
             func: Arc::new(func),
             queue: Default::default(),
             task_map: Default::default(),
+            sender,
+            receiver,
         };
         Ok(consumer)
     }
@@ -137,12 +145,44 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Deserialize
             Some(expired)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
                 self.try_occupy_task(expired).await
             }
+            Some(key)=self.receiver.recv()=>{
+                self.post_running(key).await;
+            }
         }
+    }
+
+    async fn post_running(&mut self, key: String) {
+        // 1. check task state
+        let task_state = match self.task_map.remove(&key) {
+            None => {
+                return;
+            }
+            Some(v) => { v }
+        };
+        // 2. update its state based on running result
+        if !task_state.handler.is_finished() {
+            warn!("task state is not finished during post running, key={}",key);
+        }
+        match task_state.handler.await.unwrap() {
+            Ok(returns) => {
+                self.mark_task_success(key, returns).await;
+            }
+            Err(e) => {
+                self.mark_task_failed(key, e).await;
+            }
+        }
+        // 3. notify outside components
+
     }
 
     pub fn is_task_running(&self, key: impl AsRef<str>) -> bool {
         self.task_map.contains_key(key.as_ref())
     }
+
+    async fn mark_task_success(&self, key: String, returns: K) {
+        self.collection.update_one()
+    }
+    async fn mark_task_failed(&self, key: String, e: MSchedulerError) {}
 
     async fn try_occupy_task(&mut self, expired: Expired<String>) {
         let deadline = expired.deadline();
@@ -157,7 +197,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Deserialize
                 // save task state and run it
                 let params = task.params.clone();
                 let arc = self.func.clone();
-                let task_state = TaskState::run(arc, params);
+                let task_state = TaskState::run(arc, params, self.sender.clone(), task.key.clone());
                 self.task_map.insert(task.key.clone(), task_state);
             }
             Err(MSchedulerError::MongoDbError(e)) => {
