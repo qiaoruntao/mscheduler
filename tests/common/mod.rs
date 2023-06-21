@@ -1,6 +1,7 @@
 use std::env;
 
 use mongodb::{Client, Collection};
+use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ResolverConfig};
 
 use mscheduler::tasker::task::Task;
@@ -17,5 +18,6 @@ pub async fn get_collection(collection_name: impl AsRef<str>) -> Collection<Task
     let client = Client::with_options(client_options).unwrap();
     let database = client.database(target_database.as_str());
     let collection = database.collection::<Task<i32, i32>>(collection_name.as_ref());
+    collection.delete_many(doc! {}, None).await.expect("failed to clean up collection");
     collection
 }

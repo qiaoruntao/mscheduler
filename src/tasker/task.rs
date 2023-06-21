@@ -6,13 +6,15 @@ pub struct TaskWorkerState<K> {
     // worker identifier
     pub worker_id: String,
     // how many unexpected retry has occurred
-    pub unexpected_retry_cnt: u32,
+    pub unexpected_retry_cnt: Option<u32>,
     // when can other workers accept this task
     pub ping_expire_time: Option<DateTime>,
     // when did this task success
     pub success_time: Option<DateTime>,
     // when did this task failed
     pub fail_time: Option<DateTime>,
+    // fail reason
+    pub fail_reason: Option<String>,
     // task return values
     pub returns: Option<K>,
 }

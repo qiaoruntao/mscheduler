@@ -16,6 +16,8 @@ pub struct SendTaskOption {
     pub update_existing_params: bool,
     // specific a custom task start time
     pub run_time: Option<DateTime>,
+    // how many concurrency workers are allowed
+    pub concurrency_cnt: u32,
     // clean up existing task's success worker states
     // pub clean_success: bool,
     // clean up existing task's failed worker states
@@ -30,6 +32,7 @@ impl Default for SendTaskOption {
             run_time: None,
             // clean_success: false,
             // clean_failed: false,
+            concurrency_cnt: 1,
         }
     }
 }
@@ -55,7 +58,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
         let start_time = send_option.run_time.clone().unwrap_or(now);
         let task_option = TaskOption {
             priority: 0,
-            concurrent_worker_cnt: 1,
+            concurrent_worker_cnt: send_option.concurrency_cnt,
             ping_interval_ms: 30_000,
             worker_timeout_ms: 60_000,
             min_worker_version: 0,

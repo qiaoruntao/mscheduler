@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use strum::Display;
 
-#[derive(Debug)]
+#[derive(Debug, Display)]
 pub enum MSchedulerError {
     AddTaskFailed,
     NoTaskMatched,
