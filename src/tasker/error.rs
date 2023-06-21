@@ -3,7 +3,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum MSchedulerError {
     AddTaskFailed,
-    NoTaskAvailable,
+    NoTaskMatched,
     // mongo db returns an error that cannot get handled
     MongoDbError(Arc<mongodb::error::Error>),
 }

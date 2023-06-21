@@ -1,18 +1,18 @@
 use std::collections::HashMap;
+use std::f32::consts::E;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration};
 
 use async_trait::async_trait;
-use futures::future::Join;
-use futures::{FutureExt, StreamExt};
-use mongodb::bson::{DateTime, doc, Document, from_document};
+use futures::{StreamExt};
+use mongodb::bson::{bson, DateTime, doc, Document, from_document, to_document};
 use mongodb::change_stream::ChangeStream;
 use mongodb::change_stream::event::ChangeStreamEvent;
 use mongodb::Collection;
 use mongodb::options::{ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -21,6 +21,7 @@ use tokio_util::time::DelayQueue;
 use tracing::{error, warn};
 
 use crate::tasker::error::{MResult, MSchedulerError};
+use crate::tasker::error::MSchedulerError::MongoDbError;
 use crate::tasker::task::Task;
 
 #[async_trait]
@@ -68,6 +69,7 @@ pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     marker: PhantomData<Task<T, K>>,
     collection: Collection<Task<T, K>>,
     func: Arc<Func>,
+    config: TaskConsumerConfig,
     queue: DelayQueue<String>,
     task_map: HashMap<String, TaskState<T, K, Func>>,
     sender: Sender<String>,
@@ -80,13 +82,14 @@ struct NextDoc {
     pub start_time: DateTime,
 }
 
-impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send> TaskConsumer<T, K, Func> {
-    pub async fn create(collection: Collection<Task<T, K>>, func: Func) -> MResult<Self> {
+impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send> TaskConsumer<T, K, Func> {
+    pub async fn create(collection: Collection<Task<T, K>>, func: Func, config: TaskConsumerConfig) -> MResult<Self> {
         let (sender, receiver) = tokio::sync::mpsc::channel(10);
         let consumer = TaskConsumer {
             marker: Default::default(),
             collection,
             func: Arc::new(func),
+            config,
             queue: Default::default(),
             task_map: Default::default(),
             sender,
@@ -172,15 +175,36 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Deserialize
             }
         }
         // 3. notify outside components
-
     }
 
     pub fn is_task_running(&self, key: impl AsRef<str>) -> bool {
         self.task_map.contains_key(key.as_ref())
     }
 
-    async fn mark_task_success(&self, key: String, returns: K) {
-        self.collection.update_one()
+    // update worker state to success if not already success
+    async fn mark_task_success(&self, key: String, returns: K) -> MResult<()> {
+        let query = doc! {
+            "key":&key,
+            "task_state.worker_states.worker_id": &self.config.worker_id
+        };
+        let update = doc! {
+            "$set": {
+                "task_state.worker_states.$.success_time": "$$NOW",
+                "task_state.worker_states.$.returns": to_document(&returns).expect("failed to serialize returns"),
+            }
+        };
+        match self.collection.update_one(query, update, None).await {
+            Ok(v) => {
+                if v.modified_count == 0 {
+                    Err(MSchedulerError::NoTaskMatched)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                Err(MongoDbError(e.into()))
+            }
+        }
     }
     async fn mark_task_failed(&self, key: String, e: MSchedulerError) {}
 
@@ -210,7 +234,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Deserialize
     }
 
     async fn occupy_task(&mut self, key: impl AsRef<str>) -> MResult<Task<T, K>> {
-        let worker_id = "";
+        let worker_id = self.config.worker_id.as_str();
         let filter = doc! {
                 "$and":[
                 // check for certain key
@@ -294,7 +318,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Deserialize
                 Ok(task)
             }
             Ok(None) => {
-                Err(MSchedulerError::NoTaskAvailable)
+                Err(MSchedulerError::NoTaskMatched)
             }
             Err(e) => {
                 Err(MSchedulerError::MongoDbError(e.into()))
