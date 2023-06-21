@@ -71,7 +71,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
                 "key":key.as_ref(),
                 "task_state.create_time":now,
                 "task_state.start_time":start_time,
-                "task_state.worker_states":Bson::Array(vec![]),
+                "task_state.worker_states":[],
                 "task_option":to_document(&task_option).unwrap(),
             },
         };

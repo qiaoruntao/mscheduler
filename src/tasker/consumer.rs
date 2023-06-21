@@ -401,6 +401,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         doc! {
             "$match":{
                 "$and":[
+                     {"task_state.worker_states":{"$exists":true}},
                      {
                         "$or":[
                             { "task_option.min_worker_version": { "$exists": false } },
@@ -424,7 +425,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                                             "$filter": {
                                                 "input": "$task_state.worker_states",
                                                 "as": "item",
-                                                "cond": { "$gt": vec!["$$item.ping_expire_time", "$$NOW"] }
+                                                "cond": { "$gt": ["$$item.ping_expire_time", "$$NOW"] }
                                             }
                                         }
                                     }, "$task_option.concurrent_worker_cnt"]
