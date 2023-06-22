@@ -1,4 +1,4 @@
-use mongodb::bson::{Bson, DateTime, doc, to_bson, to_document};
+use mongodb::bson::{DateTime, doc, to_bson, to_document};
 use mongodb::Collection;
 use mongodb::options::UpdateOptions;
 use serde::Serialize;
@@ -38,8 +38,8 @@ impl Default for SendTaskOption {
 }
 
 pub struct SendTaskResult {
-    insert_new: bool,
-    update_existing: bool,
+    pub insert_new: bool,
+    pub update_existing: bool,
 }
 
 impl<T: Serialize, K: Serialize> TaskProducer<T, K> {

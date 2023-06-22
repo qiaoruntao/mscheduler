@@ -18,11 +18,13 @@ mod test {
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to generate producer");
         let random = DateTime::now().timestamp_millis() % 1000;
         let key = "111";
-        task_producer.send_task(key, random as i32, None).await.expect("failed to send new task");
+        let send_task_result = task_producer.send_task(key, random as i32, None).await.expect("failed to send new task");
         let task = collection.find_one(doc! {"key":key}, None).await.expect("failed to find new task in db").expect("no task returns");
         assert!(task.params.is_some());
         assert_eq!(task.params.unwrap(), random as i32);
         assert_eq!(task.key, key);
+        assert!(!send_task_result.update_existing);
+        assert!(send_task_result.insert_new);
     }
 
     #[tokio::test]
@@ -35,11 +37,13 @@ mod test {
         let random = (DateTime::now().timestamp_millis() % 1000) as i32;
         let key = "111";
         // insert a new task
-        task_producer.send_task(key, random, None).await.expect("failed to send new task");
+        let send_task_result = task_producer.send_task(key, random, None).await.expect("failed to send new task");
         let task = collection.find_one(doc! {"key":key}, None).await.expect("failed to find new task in db").expect("no task returns");
         assert!(task.params.is_some());
         assert_eq!(task.params.unwrap(), random);
         assert_eq!(task.key, key);
+        assert!(!send_task_result.update_existing);
+        assert!(send_task_result.insert_new);
         // reinsert task with a different parameter, but no specific to update parameter
         task_producer.send_task(key, random + 1, None).await.expect("failed to send new task");
         let task = collection.find_one(doc! {"key":key}, None).await.expect("failed to find new task in db").expect("no task returns");
@@ -59,7 +63,9 @@ mod test {
         let mut send_task_option = SendTaskOption::default();
         send_task_option.run_time = Some(run_time);
         // reinsert task with a different run time
-        task_producer.send_task(key, random + 1, Some(send_task_option)).await.expect("failed to send new task");
+        let send_task_result = task_producer.send_task(key, random + 1, Some(send_task_option)).await.expect("failed to send new task");
+        assert!(send_task_result.update_existing);
+        assert!(!send_task_result.insert_new);
         let task = collection.find_one(doc! {"key":key}, None).await.expect("failed to find new task in db").expect("no task returns");
         assert!(task.params.is_some());
         assert_eq!(task.task_state.start_time, run_time);

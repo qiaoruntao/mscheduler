@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use mongodb::bson::{Bson, DateTime, doc, Document, from_document, to_document};
+use mongodb::bson::{Bson, DateTime, doc, Document, from_document, to_bson};
 use mongodb::change_stream::ChangeStream;
 use mongodb::change_stream::event::ChangeStreamEvent;
 use mongodb::Collection;
@@ -17,10 +17,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
-use tracing::{debug, error, warn};
+use tracing::{error, trace, warn};
 
 use crate::tasker::error::{MResult, MSchedulerError};
-use crate::tasker::error::MSchedulerError::MongoDbError;
+use crate::tasker::error::MSchedulerError::{MongoDbError, NoTaskMatched};
 use crate::tasker::task::Task;
 
 #[async_trait]
@@ -39,26 +39,24 @@ pub struct TaskConsumerConfig {
 }
 
 
-pub struct TaskState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
-    _func: PhantomData<Func>,
-    params: Option<T>,
+pub struct TaskState<K: Send> {
     handler: JoinHandle<MResult<K>>,
 }
 
-impl<T: Send + Clone + 'static, K: Send + 'static, Func: TaskConsumerFunc<T, K>> TaskState<T, K, Func> {
-    pub fn run(arc: Arc<Func>, params: Option<T>, sender: Sender<String>, key: String) -> TaskState<T, K, Func> {
+impl<K: Send + 'static> TaskState<K> {
+    pub fn run<T: Send + Clone + 'static, Func: TaskConsumerFunc<T, K>>(arc: Arc<Func>, params: Option<T>, sender: Sender<String>, key: String) -> TaskState<K> {
         let handler = tokio::spawn({
             let arc = arc.clone();
             let params = params.clone();
             async move {
                 let result = arc.consumer(params).await;
-                sender.send(key).await;
+                if let Err(e) = sender.send(key).await {
+                    error!("failed to send task state update message {}",&e);
+                }
                 result
             }
         });
         TaskState {
-            _func: Default::default(),
-            params,
             handler,
         }
     }
@@ -70,7 +68,7 @@ pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     func: Arc<Func>,
     config: TaskConsumerConfig,
     queue: DelayQueue<String>,
-    task_map: HashMap<String, TaskState<T, K, Func>>,
+    task_map: HashMap<String, TaskState<K>>,
     sender: Sender<String>,
     receiver: Receiver<String>,
 }
@@ -99,7 +97,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     pub fn add2queue(&mut self, key: String, run_time: DateTime) {
         let diff = run_time.timestamp_millis() - DateTime::now().timestamp_millis();
-        debug!("add key {} to wait queue",&key);
+        trace!("add key {} to wait queue",&key);
         if diff <= 0 {
             self.queue.insert(key, Duration::ZERO);
         } else {
@@ -110,45 +108,46 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     pub async fn start(&mut self) {
         // 1. TODO: fetch worker config
-        let config = TaskConsumerConfig {
-            worker_version: 1,
-            worker_id: "aaaa".to_string(),
-            allow_consume: true,
-        };
         // 2. start change stream
-        let mut change_stream = self.gen_change_stream(&config).await.unwrap();
+        let mut change_stream = self.gen_change_stream().await.unwrap();
         // init next_run_time
-        let filter = Self::gen_pipeline(&config);
+        let filter = Self::gen_pipeline(&self.config);
         let mut cursor = self.collection.aggregate([filter], None).await.unwrap();
         if let Some(Ok(task)) = cursor.next().await {
             let task = from_document::<Task<i32, i32>>(task).unwrap();
             self.add2queue(task.key, task.task_state.start_time);
         }
+        trace!("start to wait for change stream, worker_id={}", &self.config.worker_id);
         // 3. wait to consume task at next_run_time
-        tokio::select! {
-            Some(result) = change_stream.next()=>{
-                match result {
-                    Ok(change_event) => {
-                        match change_event.full_document {
-                            None => {
-                                return;
-                            }
-                            Some(doc) => {
-                                self.add2queue(doc.key, doc.start_time)
+        loop {
+            tokio::select! {
+                Some(result) = change_stream.next()=>{
+                    match result {
+                        Ok(change_event) => {
+                            match change_event.full_document {
+                                None => {
+                                    warn!("full document not provided");
+                                    return;
+                                }
+                                Some(doc) => {
+                                    self.add2queue(doc.key, doc.start_time)
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("{}",e);
-                        return;
+                        Err(e) => {
+                            error!("change stream failed {}",e);
+                            return;
+                        }
                     }
                 }
-            }
-            Some(expired)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
-                self.try_occupy_task(expired).await
-            }
-            Some(key)=self.receiver.recv()=>{
-                self.post_running(key).await;
+                Some(expired)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
+                    self.try_occupy_task(expired).await
+                }
+                Some(key)=self.receiver.recv()=>{
+                    if let Err(e)=self.post_running(key).await{
+                        error!("failed to execute post running {}",&e);
+                    }
+                }
             }
         }
     }
@@ -157,12 +156,13 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         self.task_map.contains_key(key.as_ref())
     }
 
-    async fn post_running(&mut self, key: String) {
-        debug!("start to post handling key {} worker_id {}", key, &self.config.worker_id);
+    async fn post_running(&mut self, key: String) -> MResult<()> {
+        trace!("start to post handling key {} worker_id {}", key, &self.config.worker_id);
         // 1. check task state
         let task_state = match self.task_map.remove(&key) {
             None => {
-                return;
+                error!("failed to get task state for key {}", &key);
+                return Err(NoTaskMatched);
             }
             Some(v) => { v }
         };
@@ -170,15 +170,16 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         if !task_state.handler.is_finished() {
             warn!("task state is not finished during post running, key={}",key);
         }
-        match task_state.handler.await.unwrap() {
+        let handle_result = match task_state.handler.await.unwrap() {
             Ok(returns) => {
-                self.mark_task_success(key, returns).await;
+                self.mark_task_success(key, returns).await
             }
             Err(e) => {
-                self.mark_task_failed(key, e).await;
+                self.mark_task_failed(key, e).await
             }
-        }
+        };
         // 3. notify outside components
+        handle_result
     }
 
     // update worker state to success if not already success
@@ -188,9 +189,11 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             "task_state.worker_states.worker_id": &self.config.worker_id
         };
         let update = doc! {
+            "$currentDate":{
+                "task_state.worker_states.$.success_time": true,
+            },
             "$set": {
-                "task_state.worker_states.$.success_time": "$$NOW",
-                "task_state.worker_states.$.returns": to_document(&returns).expect("failed to serialize returns"),
+                "task_state.worker_states.$.returns": to_bson(&returns).expect("failed to serialize returns"),
             },
             "$unset":{
                 "task_state.worker_states.$.unexpected_retry_cnt":"",
@@ -200,12 +203,15 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         match self.collection.update_one(query, update, None).await {
             Ok(v) => {
                 if v.modified_count == 0 {
-                    Err(MSchedulerError::NoTaskMatched)
+                    error!("failed to set task {} to success", &key);
+                    Err(NoTaskMatched)
                 } else {
+                    trace!("set task {} to success", &key);
                     Ok(())
                 }
             }
             Err(e) => {
+                error!("failed to set task {} to success, {}", &key, &e);
                 Err(MongoDbError(e.into()))
             }
         }
@@ -216,11 +222,9 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 "task_state.worker_states.worker_id": &self.config.worker_id
             };
         let update = doc! {
+                "$currentDate":{"task_state.worker_states.$.fail_time": true},
+                "$inc":{"task_state.worker_states.$.unexpected_retry_cnt": 1},
                 "$set": {
-                    "task_state.worker_states.$.unexpected_retry_cnt": {
-                        "$add": ["$task_state.worker_states.$.unexpected_retry_cnt", 1]
-                    },
-                    "task_state.worker_states.$.fail_time": "$$NOW",
                     "task_state.worker_states.$.fail_reason": format!("{}",e),
                 },
                 "$unset":{
@@ -231,12 +235,15 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         match self.collection.update_one(query, update, None).await {
             Ok(v) => {
                 if v.modified_count == 0 {
-                    Err(MSchedulerError::NoTaskMatched)
+                    error!("failed to set task {} to failed", &key);
+                    Err(NoTaskMatched)
                 } else {
+                    trace!("set task {} to fail", &key);
                     Ok(())
                 }
             }
             Err(e) => {
+                error!("failed to set task {} to fail, {}", &key, &e);
                 Err(MongoDbError(e.into()))
             }
         }
@@ -256,14 +263,14 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 let params = task.params.clone();
                 let arc = self.func.clone();
                 let task_state = TaskState::run(arc, params, self.sender.clone(), task.key.clone());
-                debug!("success to occupy task key {}",&key);
+                trace!("success to occupy task key {}",&key);
                 self.task_map.insert(task.key.clone(), task_state);
             }
             Err(MongoDbError(e)) => {
                 error!("failed to occupy task error={}",e);
             }
             Err(e) => {
-                debug!("failed to occupy task key {}, error {}",&key, &e);
+                trace!("failed to occupy task key {}, error {}",&key, &e);
                 // ignore normal errors
             }
         }
@@ -273,65 +280,64 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let worker_id = self.config.worker_id.as_str();
         let filter = doc! {
                 "$and":[
-                // check for certain key
-                {
-                    "key":key.as_ref()
-                },
-                // check worker version
-                 {
-                    "$or": [
-                         { "task_option.min_worker_version": { "$exists": false } },
-                        { "task_option.min_worker_version": { "$lt": 111 } },
-                    ]
-                },
-                // check specific worker
-                {
-                    "$or": [
-                        { "task_option.specific_worker_ids": { "$exists": false } },
-                        { "task_option.specific_worker_ids": { "$size": 0 } },
-                        { "task_option.specific_worker_ids": worker_id },
-                    ]
-                },
-                // check not already occupied by self
-                {
-                    "$nor": [{
-                        "task_state.worker_states": {
-                            "$elemMatch": {
-                                "worker_id": worker_id,
-                                "ping_expire_time": { "$gt": "$$NOW" }
+                    // check for certain key
+                    {
+                        "key":key.as_ref()
+                    },
+                    // check worker version
+                     {
+                        "$or": [
+                            { "task_option.min_worker_version": { "$exists": false } },
+                            { "task_option.min_worker_version": { "$lt": 111 } },
+                        ]
+                    },
+                    // check specific worker
+                    {
+                        "$or": [
+                            { "task_option.specific_worker_ids": { "$exists": false } },
+                            { "task_option.specific_worker_ids": { "$size": 0 } },
+                            { "task_option.specific_worker_ids": worker_id },
+                        ]
+                    },
+                    // check not already occupied by self
+                    {
+                        "$nor": [{
+                            "task_state.worker_states": {
+                                "$elemMatch": {
+                                    "worker_id": worker_id,
+                                    "ping_expire_time": { "$gt": "$$NOW" }
+                                }
                             }
-                        }
-                    }]
-                },
-                // check worker count
-                {
-                    "$or": [
-                        { "task_state.worker_states": { "$size": 0 } },
-                        // optimize for only one worker condition
-                        {
-                            "$expr": {
-                                "$lt": [{
-                                    "$size": {
-                                        "$filter": {
-                                            "input": "$task_state.worker_states",
-                                            "as": "item",
-                                            "cond": {"$or":[
-                                              { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
-                                              { "$ne": ["$$item.success_time", Bson::Null] },
-                                              { "$ne": ["$$item.fail_time", Bson::Null] },
-                                            ]}
+                        }]
+                    },
+                    // check worker count
+                    {
+                        "$or": [
+                            { "task_state.worker_states": { "$size": 0 } },
+                            // optimize for only one worker condition
+                            {
+                                "$expr": {
+                                    "$lt": [{
+                                        "$size": {
+                                            "$filter": {
+                                                "input": "$task_state.worker_states",
+                                                "as": "item",
+                                                "cond": {"$or":[
+                                                  { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
+                                                  { "$ne": ["$$item.success_time", Bson::Null] },
+                                                  { "$ne": ["$$item.fail_time", Bson::Null] },
+                                                ]}
+                                            }
                                         }
-                                    }
-                                }, "$task_option.concurrent_worker_cnt"]
-                            }
-                        },
-                    ]
-                }
-            ]
+                                    }, "$task_option.concurrent_worker_cnt"]
+                                }
+                            },
+                        ]
+                    }
+                ]
             };
         let update = vec![doc! {
             "$set": {
-                "a": "",
                 "task_state.worker_states": {
                     "$concatArrays": [{
                         "$filter": {
@@ -362,7 +368,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 Ok(task)
             }
             Ok(None) => {
-                Err(MSchedulerError::NoTaskMatched)
+                Err(NoTaskMatched)
             }
             Err(e) => {
                 Err(MongoDbError(e.into()))
@@ -370,10 +376,10 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn gen_change_stream(&mut self, config: &TaskConsumerConfig) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
+    async fn gen_change_stream(&mut self) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
         let pipeline = [
             // only consider the task we can run
-            Self::gen_pipeline(&config),
+            Self::gen_pipeline(&self.config),
             doc! {
                 "$project":{
                     // _id cannot get filtered, will get error if filtered
@@ -405,7 +411,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                      {
                         "$or":[
                             { "task_option.min_worker_version": { "$exists": false } },
-                            { "task_option.min_worker_version": { "$lt": &config.worker_version } },
+                            { "task_option.min_worker_version": { "$lte": &config.worker_version } },
                         ]
                     },
                      {
