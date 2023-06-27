@@ -18,6 +18,7 @@ pub struct SendTaskOption {
     pub run_time: Option<DateTime>,
     // how many concurrency workers are allowed
     pub concurrency_cnt: u32,
+    pub min_worker_version: u32,
     // clean up existing task's success worker states
     // pub clean_success: bool,
     // clean up existing task's failed worker states
@@ -33,6 +34,7 @@ impl Default for SendTaskOption {
             // clean_success: false,
             // clean_failed: false,
             concurrency_cnt: 1,
+            min_worker_version: 0,
         }
     }
 }
@@ -61,7 +63,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
             concurrent_worker_cnt: send_option.concurrency_cnt,
             ping_interval_ms: 30_000,
             worker_timeout_ms: 60_000,
-            min_worker_version: 0,
+            min_worker_version: send_option.min_worker_version,
             specific_worker_ids: vec![],
             max_unexpected_retries: 3,
             unexpected_retry_delay_ms: 10_000,

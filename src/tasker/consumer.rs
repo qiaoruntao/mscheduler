@@ -20,7 +20,7 @@ use tokio_util::time::DelayQueue;
 use tracing::{error, trace, warn};
 
 use crate::tasker::error::{MResult, MSchedulerError};
-use crate::tasker::error::MSchedulerError::{MongoDbError, NoTaskMatched};
+use crate::tasker::error::MSchedulerError::{ExecutionError, MongoDbError, NoTaskMatched};
 use crate::tasker::task::Task;
 
 #[async_trait]
@@ -178,7 +178,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 self.mark_task_failed(key, e).await
             }
         };
-        // 3. notify outside components
+        // TODO: 3. notify outside components
         handle_result
     }
 
@@ -217,11 +217,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
     async fn mark_task_failed(&self, key: String, e: MSchedulerError) -> MResult<()> {
-        let query = doc! {
-                "key": &key,
-                "task_state.worker_states.worker_id": &self.config.worker_id
-            };
-        let update = doc! {
+        let update = if let ExecutionError(_) = e {
+            doc! {
                 "$currentDate":{"task_state.worker_states.$.fail_time": true},
                 "$inc":{"task_state.worker_states.$.unexpected_retry_cnt": 1},
                 "$set": {
@@ -231,6 +228,23 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     "task_state.worker_states.$.success_time": Bson::Null,
                     "task_state.worker_states.$.returns": Bson::Null
                 }
+            }
+        } else {
+            doc! {
+                "$currentDate":{"task_state.worker_states.$.fail_time": true},
+                "$set": {
+                    "task_state.worker_states.$.fail_reason": format!("{}",e),
+                    "task_state.worker_states.$.unexpected_retry_cnt": 0,
+                },
+                "$unset":{
+                    "task_state.worker_states.$.success_time": Bson::Null,
+                    "task_state.worker_states.$.returns": Bson::Null
+                }
+            }
+        };
+        let query = doc! {
+                "key": &key,
+                "task_state.worker_states.worker_id": &self.config.worker_id
             };
         match self.collection.update_one(query, update, None).await {
             Ok(v) => {
@@ -288,7 +302,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                      {
                         "$or": [
                             { "task_option.min_worker_version": { "$exists": false } },
-                            { "task_option.min_worker_version": { "$lt": 111 } },
+                            { "task_option.min_worker_version": { "$lte": &self.config.worker_version } },
                         ]
                     },
                     // check specific worker
