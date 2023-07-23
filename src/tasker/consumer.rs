@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+use futures::future::err;
 use mongodb::bson::{Bson, DateTime, doc, Document, from_document, to_bson};
 use mongodb::change_stream::ChangeStream;
 use mongodb::change_stream::event::ChangeStreamEvent;
@@ -20,7 +21,7 @@ use tokio_util::time::DelayQueue;
 use tracing::{error, trace, warn};
 
 use crate::tasker::error::{MResult, MSchedulerError};
-use crate::tasker::error::MSchedulerError::{ExecutionError, MongoDbError, NoTaskMatched};
+use crate::tasker::error::MSchedulerError::{ExecutionError, MongoDbError, NoTaskMatched, PanicError, TaskCancelled, UnknownError};
 use crate::tasker::task::Task;
 
 #[async_trait]
@@ -49,7 +50,22 @@ impl<K: Send + 'static> TaskState<K> {
             let arc = arc.clone();
             let params = params.clone();
             async move {
-                let result = arc.consumer(params).await;
+                let result = match tokio::spawn(async move { arc.consumer(params).await }).catch_unwind().await {
+                    Ok(Ok(v)) => { v }
+                    Ok(Err(e)) => {
+                        if e.is_panic() {
+                            Err(PanicError)
+                        } else if e.is_cancelled() {
+                            Err(TaskCancelled)
+                        } else {
+                            unreachable!();
+                        }
+                    }
+                    Err(_) => {
+                        error!("unexpected error found");
+                        Err(UnknownError)
+                    }
+                };
                 if let Err(e) = sender.send(key).await {
                     error!("failed to send task state update message {}",&e);
                 }
@@ -196,7 +212,6 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 "task_state.worker_states.$.returns": to_bson(&returns).expect("failed to serialize returns"),
             },
             "$unset":{
-                "task_state.worker_states.$.unexpected_retry_cnt":"",
                 "task_state.worker_states.$.fail_time": "",
             }
         };
@@ -220,7 +235,6 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let update = if let ExecutionError(_) = e {
             doc! {
                 "$currentDate":{"task_state.worker_states.$.fail_time": true},
-                "$inc":{"task_state.worker_states.$.unexpected_retry_cnt": 1},
                 "$set": {
                     "task_state.worker_states.$.fail_reason": format!("{}",e),
                 },
@@ -234,7 +248,6 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 "$currentDate":{"task_state.worker_states.$.fail_time": true},
                 "$set": {
                     "task_state.worker_states.$.fail_reason": format!("{}",e),
-                    "task_state.worker_states.$.unexpected_retry_cnt": 0,
                 },
                 "$unset":{
                     "task_state.worker_states.$.success_time": Bson::Null,
@@ -365,7 +378,6 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                         }
                     }, [{
                         "worker_id": worker_id,
-                        "unexpected_retry_cnt": 0,
                         "ping_expire_time": "$$NOW",
                     }]]
                 }

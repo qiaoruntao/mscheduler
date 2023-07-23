@@ -54,7 +54,6 @@ mod test {
         assert_eq!(task.task_state.worker_states.len(), 1);
         let worker_state = task.task_state.worker_states.get(0).unwrap();
         assert_eq!(worker_state.worker_id, worker_id);
-        assert_eq!(worker_state.unexpected_retry_cnt, None);
         assert!(worker_state.success_time.is_some());
     }
 
@@ -76,7 +75,6 @@ mod test {
         assert_eq!(task.task_state.worker_states.len(), 1);
         let worker_state = task.task_state.worker_states.get(0).unwrap();
         assert_eq!(worker_state.worker_id, worker_id);
-        assert_eq!(worker_state.unexpected_retry_cnt, Some(1));
         assert_eq!(worker_state.success_time, None);
         assert!(worker_state.fail_time.is_some());
     }
@@ -107,7 +105,6 @@ mod test {
         assert_eq!(task.task_state.worker_states.len(), 2);
         let worker_state = task.task_state.worker_states.get(0).unwrap();
         // assert_eq!(worker_state.worker_id, worker_id1);
-        assert_eq!(worker_state.unexpected_retry_cnt, None);
         assert!(worker_state.success_time.is_some());
     }
 
@@ -141,9 +138,7 @@ mod test {
         let fail_worker_state = task.task_state.worker_states.iter().filter(|s| s.fail_time.is_some()).next();
         assert!(fail_worker_state.is_some());
         let fail_worker_state = fail_worker_state.unwrap();
-        assert_eq!(success_worker_state.unexpected_retry_cnt, None);
         assert!(success_worker_state.success_time.is_some());
-        assert_eq!(fail_worker_state.unexpected_retry_cnt, Some(1));
         assert!(fail_worker_state.fail_time.is_some());
     }
 
@@ -180,7 +175,6 @@ mod test {
         let task = collection.find_one(doc! {"key":"111"}, None).await.expect("failed to find").expect("no task found");
         assert_eq!(task.task_state.worker_states.len(), 1);
         let success_worker_state = &task.task_state.worker_states[0];
-        assert_eq!(success_worker_state.unexpected_retry_cnt, None);
         assert!(success_worker_state.success_time.is_some());
     }
 }

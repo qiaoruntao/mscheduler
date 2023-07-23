@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 pub struct TaskWorkerState<K> {
     // worker identifier
     pub worker_id: String,
-    // how many unexpected retry has occurred
-    pub unexpected_retry_cnt: Option<u32>,
     // when can other workers accept this task
     pub ping_expire_time: Option<DateTime>,
     // when did this task success
