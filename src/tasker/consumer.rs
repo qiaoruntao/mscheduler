@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
-use futures::future::err;
 use mongodb::bson::{Bson, DateTime, doc, Document, from_document, to_bson};
 use mongodb::change_stream::ChangeStream;
 use mongodb::change_stream::event::ChangeStreamEvent;
@@ -19,6 +18,7 @@ use tokio::time::Instant;
 use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
 use tracing::{error, trace, warn};
+use typed_builder::TypedBuilder;
 
 use crate::tasker::error::{MResult, MSchedulerError};
 use crate::tasker::error::MSchedulerError::{ExecutionError, MongoDbError, NoTaskMatched, PanicError, TaskCancelled, UnknownError};
@@ -29,14 +29,33 @@ pub trait TaskConsumerFunc<T: Send, K: Send>: Send + Sync + 'static {
     async fn consumer(&self, params: Option<T>) -> MResult<K>;
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, TypedBuilder, Default)]
+#[builder(field_defaults(default, setter(into)))]
+#[non_exhaustive]
 pub struct TaskConsumerConfig {
     // specific this worker's version, used to choose which task to run
+    #[builder(default = 0)]
     pub worker_version: u32,
     // specific this worker's id, used to remote control worker behavior, also can be used to choose which task to run
-    pub worker_id: String,
-    // whether this worker should continue to try to accept tasks
-    pub allow_consume: bool,
+    #[builder(default_code = "hostname::get().unwrap_or_default().into_string().ok()", setter(strip_option))]
+    pub worker_id: Option<String>,
+}
+
+impl TaskConsumerConfig {
+    pub fn get_worker_version(&self) -> u32 {
+        self.worker_version
+    }
+
+    pub fn get_worker_id(&self) -> &str {
+        match &self.worker_id {
+            None => {
+                "default"
+            }
+            Some(v) => {
+                v.as_str()
+            }
+        }
+    }
 }
 
 
@@ -133,7 +152,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             let task = from_document::<Task<i32, i32>>(task).unwrap();
             self.add2queue(task.key, task.task_state.start_time);
         }
-        trace!("start to wait for change stream, worker_id={}", &self.config.worker_id);
+        trace!("start to wait for change stream, worker_id={}", self.config.get_worker_id());
         // 3. wait to consume task at next_run_time
         loop {
             tokio::select! {
@@ -173,7 +192,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     }
 
     async fn post_running(&mut self, key: String) -> MResult<()> {
-        trace!("start to post handling key {} worker_id {}", key, &self.config.worker_id);
+        trace!("start to post handling key {} worker_id {}", key, self.config.get_worker_id());
         // 1. check task state
         let task_state = match self.task_map.remove(&key) {
             None => {
@@ -202,7 +221,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     async fn mark_task_success(&self, key: String, returns: K) -> MResult<()> {
         let query = doc! {
             "key":&key,
-            "task_state.worker_states.worker_id": &self.config.worker_id
+            "task_state.worker_states.worker_id": self.config.get_worker_id()
         };
         let update = doc! {
             "$currentDate":{
@@ -257,7 +276,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         };
         let query = doc! {
                 "key": &key,
-                "task_state.worker_states.worker_id": &self.config.worker_id
+                "task_state.worker_states.worker_id": self.config.get_worker_id()
             };
         match self.collection.update_one(query, update, None).await {
             Ok(v) => {
@@ -304,7 +323,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     }
 
     async fn occupy_task(&mut self, key: impl AsRef<str>) -> MResult<Task<T, K>> {
-        let worker_id = self.config.worker_id.as_str();
+        let worker_id = self.config.get_worker_id();
         let filter = doc! {
                 "$and":[
                     // check for certain key
@@ -315,7 +334,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                      {
                         "$or": [
                             { "task_option.min_worker_version": { "$exists": false } },
-                            { "task_option.min_worker_version": { "$lte": &self.config.worker_version } },
+                            { "task_option.min_worker_version": { "$lte": &self.config.get_worker_version() } },
                         ]
                     },
                     // check specific worker
@@ -444,7 +463,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                         "$or":[
                             { "task_option.specific_worker_ids": { "$exists": false } },
                             { "task_option.specific_worker_ids": { "$size": 0 } },
-                            { "task_option.specific_worker_ids": &config.worker_id },
+                            { "task_option.specific_worker_ids": config.get_worker_id() },
                         ]
                     },
                      {

@@ -5,9 +5,13 @@
 [//]: # ([crates-badge]: https://img.shields.io/crates/v/tokio.svg)
 
 [//]: # ([crates-url]: https://crates.io/crates/tokio)
+
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
+
 [mit-url]: https://github.com/qiaoruntao/mscheduler/blob/master/LICENSE
+
 [actions-badge]: https://github.com/qiaoruntao/mscheduler/actions/workflows/ci.yml/badge.svg
+
 [actions-url]: https://github.com/qiaoruntao/mscheduler/actions?query=branch%3Amaster
 
 | Feature                    |      Bull       | Agenda |
@@ -94,13 +98,22 @@
    不影响正在执行中的任务, 变动需要在重新占用任务时体现
 
 ## 具体实现
+
 ### 发布任务
+
 直接发送就行
+
 ### 消费任务
+
 核心问题: 下一次什么时候去占用任务
+
 1. 启动时计算下一次时间next_try_time
-2. 使用change_stream实时更新next_try_time 
+2. 使用change_stream实时更新next_try_time
 
 ## TODO
+
 -[ ] clean_success 暂不实现, maintenance
 -[ ] clean_failed 暂不实现, maintenance
+-[ ] detect compatibility of collection data
+-[ ] auto worker id
+-[ ] 错误处理
