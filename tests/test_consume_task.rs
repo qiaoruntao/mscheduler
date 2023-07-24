@@ -14,6 +14,15 @@ impl TaskConsumerFunc<i32, i32> for TestConsumeFunc {
     }
 }
 
+struct TestStringConsumeFunc {}
+
+#[async_trait]
+impl TaskConsumerFunc<String, usize> for TestStringConsumeFunc {
+    async fn consumer(&self, params: Option<String>) -> MResult<usize> {
+        Ok(params.map(|v| v.len()).unwrap_or(0))
+    }
+}
+
 struct TestConsumeFailFunc {}
 
 #[async_trait]
@@ -33,7 +42,7 @@ mod test {
     use mscheduler::tasker::consumer::{TaskConsumer, TaskConsumerConfig};
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
 
-    use crate::{TestConsumeFailFunc, TestConsumeFunc};
+    use crate::{TestConsumeFailFunc, TestConsumeFunc, TestStringConsumeFunc};
     use crate::common::get_collection;
 
     #[test_log::test(tokio::test)]
@@ -45,6 +54,23 @@ mod test {
         tokio::spawn(async move { task_consumer.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         task_producer.send_task("111", 1, None).await.expect("failed to send task");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let task = collection.find_one(doc! {"key":"111"}, None).await.expect("failed to find").expect("no task found");
+        assert_eq!(task.task_state.worker_states.len(), 1);
+        let worker_state = task.task_state.worker_states.get(0).unwrap();
+        assert_eq!(worker_state.worker_id, worker_id);
+        assert!(worker_state.success_time.is_some());
+    }
+
+    #[test_log::test(tokio::test)]
+    pub async fn test_consume_string_task() {
+        let collection = get_collection("test_consume_string_task").await;
+        let consume_func = TestStringConsumeFunc {};
+        let worker_id = "aaa";
+        let mut task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
+        tokio::spawn(async move { task_consumer.start().await });
+        let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
+        task_producer.send_task("111", "test".to_string(), None).await.expect("failed to send task");
         tokio::time::sleep(Duration::from_secs(5)).await;
         let task = collection.find_one(doc! {"key":"111"}, None).await.expect("failed to find").expect("no task found");
         assert_eq!(task.task_state.worker_states.len(), 1);

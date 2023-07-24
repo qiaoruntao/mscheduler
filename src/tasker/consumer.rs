@@ -149,7 +149,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let filter = Self::gen_pipeline(&self.config);
         let mut cursor = self.collection.aggregate([filter], None).await.unwrap();
         if let Some(Ok(task)) = cursor.next().await {
-            let task = from_document::<Task<i32, i32>>(task).unwrap();
+            let task = from_document::<Task<T, K>>(task).unwrap();
             self.add2queue(task.key, task.task_state.start_time);
         }
         trace!("start to wait for change stream, worker_id={}", self.config.get_worker_id());

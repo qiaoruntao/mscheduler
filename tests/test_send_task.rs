@@ -15,7 +15,7 @@ mod test {
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
-        let task_producer = TaskProducer::create(collection.clone()).expect("failed to generate producer");
+        let task_producer = TaskProducer::<_, i32>::create(collection.clone()).expect("failed to generate producer");
         let random = DateTime::now().timestamp_millis() % 1000;
         let key = "111";
         let send_task_result = task_producer.send_task(key, random as i32, None).await.expect("failed to send new task");
@@ -33,7 +33,7 @@ mod test {
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
-        let task_producer = TaskProducer::create(collection.clone()).expect("failed to generate producer");
+        let task_producer = TaskProducer::<_, i32>::create(collection.clone()).expect("failed to generate producer");
         let random = (DateTime::now().timestamp_millis() % 1000) as i32;
         let key = "111";
         // insert a new task
