@@ -115,5 +115,5 @@
 -[ ] clean_success 暂不实现, maintenance
 -[ ] clean_failed 暂不实现, maintenance
 -[ ] detect compatibility of collection data
--[ ] auto worker id
+-[x] auto worker id
 -[ ] 错误处理
