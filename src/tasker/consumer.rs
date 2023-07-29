@@ -147,38 +147,64 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let mut change_stream = self.gen_change_stream().await.unwrap();
         // init next_run_time
         let filter = Self::gen_pipeline(&self.config);
-        let mut cursor = self.collection.aggregate([filter], None).await.unwrap();
-        if let Some(Ok(task)) = cursor.next().await {
-            let task = from_document::<Task<T, K>>(task).unwrap();
-            self.add2queue(task.key, task.task_state.start_time);
+        let pipeline = [filter];
+        {
+            let mut cursor = self.collection.aggregate(pipeline.clone(), None).await.unwrap();
+            for _ in 0..10 {
+                if let Some(Ok(task)) = cursor.next().await {
+                    let task = from_document::<Task<T, K>>(task).unwrap();
+                    self.add2queue(task.key, task.task_state.start_time);
+                } else {
+                    break;
+                }
+            }
         }
         trace!("start to wait for change stream, worker_id={}", self.config.get_worker_id());
         // 3. wait to consume task at next_run_time
         loop {
             tokio::select! {
-                Some(result) = change_stream.next()=>{
-                    match result {
-                        Ok(change_event) => {
-                            match change_event.full_document {
-                                None => {
-                                    warn!("full document not provided");
-                                    return;
+                change_stream_result = change_stream.next()=>{
+                    match change_stream_result{
+                        Some(result)=>{
+                            match result {
+                                Ok(change_event) => {
+                                    match change_event.full_document {
+                                        None => {
+                                            warn!("full document not provided");
+                                        }
+                                        Some(doc) => {
+                                            self.add2queue(doc.key, doc.start_time)
+                                        }
+                                    }
                                 }
-                                Some(doc) => {
-                                    self.add2queue(doc.key, doc.start_time)
+                                Err(e) => {
+                                    error!("change stream failed {}",e);
+                                    return;
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("change stream failed {}",e);
-                            return;
+                        None=>{
+                            warn!("change stream returns None");
                         }
                     }
                 }
                 Some(expired)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
-                    self.try_occupy_task(expired).await
+                    self.try_occupy_task(expired).await;
+                    if self.queue.is_empty(){
+                        trace!("queue empty, check remaining documents");
+                        let mut cursor = self.collection.aggregate(pipeline.clone(), None).await.unwrap();
+                        for _ in 0..10 {
+                            if let Some(Ok(task)) = cursor.next().await {
+                                let task = from_document::<Task<T, K>>(task).unwrap();
+                                self.add2queue(task.key, task.task_state.start_time);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                 }
                 Some(key)=self.receiver.recv()=>{
+                    trace!("handling post running");
                     if let Err(e)=self.post_running(key).await{
                         error!("failed to execute post running {}",&e);
                     }
@@ -423,6 +449,12 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     async fn gen_change_stream(&mut self) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
         let pipeline = [
+            doc! {
+                "$addFields":{
+                    "task_state":"$fullDocument.task_state",
+                    "task_option":"$fullDocument.task_option"
+                }
+            },
             // only consider the task we can run
             Self::gen_pipeline(&self.config),
             doc! {
@@ -466,17 +498,47 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                             { "task_option.specific_worker_ids": config.get_worker_id() },
                         ]
                     },
+                    // not already occupied
+                    {
+                        "$expr": {
+                        // running worker cnt+finished worker cnt<concurrent_worker_cnt
+                            "$eq": [{
+                                "$size": {
+                                    "$filter": {
+                                        "input": "$task_state.worker_states",
+                                        "as": "item",
+                                        "cond": { "$eq": ["$$item.worker_id", config.get_worker_id()] }
+                                    }
+                                }
+                            }, 0]
+                        }
+                    },
+                    // has worker space remains
                      {
                         "$or":[
                             { "task_state.worker_states": { "$size": 0 } },
                             {
                                 "$expr": {
+                                // running worker cnt+finished worker cnt<concurrent_worker_cnt
                                     "$lt": [{
                                         "$size": {
                                             "$filter": {
                                                 "input": "$task_state.worker_states",
                                                 "as": "item",
-                                                "cond": { "$gt": ["$$item.ping_expire_time", "$$NOW"] }
+                                                "cond": {"$or":[
+                                                    // running
+                                                    {
+                                                        "$and":[
+                                                            { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
+                                                            { "$eq": ["$$item.success_time", Bson::Null] },
+                                                            { "$eq": ["$$item.fail_time", Bson::Null] },
+                                                        ]
+                                                    },
+                                                    // success
+                                                    { "$ne": ["$$item.success_time", Bson::Null] },
+                                                    // fail
+                                                    { "$ne": ["$$item.fail_time", Bson::Null] }
+                                                ]}
                                             }
                                         }
                                     }, "$task_option.concurrent_worker_cnt"]

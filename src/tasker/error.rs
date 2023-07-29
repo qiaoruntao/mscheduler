@@ -8,6 +8,8 @@ pub enum MSchedulerError {
     AddTaskFailed,
     // cannot find matched task
     NoTaskMatched,
+    // duplicated task can be caused by various reasons
+    DuplicatedTaskId,
     // unknown error
     UnknownError,
     // panic during task execution
