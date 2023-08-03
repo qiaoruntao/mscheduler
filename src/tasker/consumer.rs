@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -102,10 +102,10 @@ pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     collection: Collection<Task<T, K>>,
     func: Arc<Func>,
     config: TaskConsumerConfig,
-    queue: DelayQueue<String>,
-    task_map: HashMap<String, TaskState<K>>,
+    queue: Mutex<DelayQueue<String>>,
+    task_map: Mutex<HashMap<String, TaskState<K>>>,
     sender: Sender<String>,
-    receiver: Receiver<String>,
+    receiver: Mutex<Receiver<String>>,
 }
 
 #[derive(Deserialize)]
@@ -125,19 +125,19 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             queue: Default::default(),
             task_map: Default::default(),
             sender,
-            receiver,
+            receiver:Mutex::new(receiver),
         };
         Ok(consumer)
     }
 
-    pub fn add2queue(&mut self, key: String, run_time: DateTime) {
+    pub fn add2queue(&self, key: String, run_time: DateTime) {
         let diff = run_time.timestamp_millis() - DateTime::now().timestamp_millis();
         trace!("add key {} to wait queue",&key);
         if diff <= 0 {
-            self.queue.insert(key, Duration::ZERO);
+            self.queue.lock().unwrap().insert(key, Duration::ZERO);
         } else {
             // diff max at about 2 years, we limit it to 1000 seconds
-            self.queue.insert(key, Duration::from_millis(diff.min(1_000_000) as u64));
+            self.queue.lock().unwrap().insert(key, Duration::from_millis(diff.min(1_000_000) as u64));
         }
     }
 
@@ -188,9 +188,9 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                         }
                     }
                 }
-                Some(expired)=futures::future::poll_fn(|cx| self.queue.poll_expired(cx))=>{
+                Some(expired)=futures::future::poll_fn(|cx| self.queue.lock().unwrap().poll_expired(cx))=>{
                     self.try_occupy_task(expired).await;
-                    if self.queue.is_empty(){
+                    if {self.queue.lock().unwrap().is_empty()}{
                         trace!("queue empty, check remaining documents");
                         let mut cursor = self.collection.aggregate(pipeline.clone(), None).await.unwrap();
                         for _ in 0..10 {
@@ -203,7 +203,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                         }
                     }
                 }
-                Some(key)=self.receiver.recv()=>{
+                Some(key)=self.receiver.lock().unwrap().recv()=>{
                     trace!("handling post running");
                     if let Err(e)=self.post_running(key).await{
                         error!("failed to execute post running {}",&e);
@@ -214,13 +214,13 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     }
 
     pub fn is_task_running(&self, key: impl AsRef<str>) -> bool {
-        self.task_map.contains_key(key.as_ref())
+        self.task_map.lock().unwrap().contains_key(key.as_ref())
     }
 
-    async fn post_running(&mut self, key: String) -> MResult<()> {
+    async fn post_running(&self, key: String) -> MResult<()> {
         trace!("start to post handling key {} worker_id {}", key, self.config.get_worker_id());
         // 1. check task state
-        let task_state = match self.task_map.remove(&key) {
+        let task_state = match self.task_map.lock().unwrap().remove(&key) {
             None => {
                 error!("failed to get task state for key {}", &key);
                 return Err(NoTaskMatched);
@@ -321,7 +321,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn try_occupy_task(&mut self, expired: Expired<String>) {
+    async fn try_occupy_task(&self, expired: Expired<String>) {
         let deadline = expired.deadline();
         let key = expired.get_ref();
         if deadline + Duration::from_secs(100) < Instant::now() {
@@ -336,7 +336,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 let arc = self.func.clone();
                 let task_state = TaskState::run(arc, params, self.sender.clone(), task.key.clone());
                 trace!("success to occupy task key {}",&key);
-                self.task_map.insert(task.key.clone(), task_state);
+                { self.task_map.lock().unwrap().insert(task.key.clone(), task_state); }
             }
             Err(MongoDbError(e)) => {
                 error!("failed to occupy task error={}",e);
@@ -348,7 +348,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn occupy_task(&mut self, key: impl AsRef<str>) -> MResult<Task<T, K>> {
+    async fn occupy_task(&self, key: impl AsRef<str>) -> MResult<Task<T, K>> {
         let worker_id = self.config.get_worker_id();
         let filter = doc! {
                 "$and":[
@@ -447,7 +447,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn gen_change_stream(&mut self) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
+    async fn gen_change_stream(&self) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
         let pipeline = [
             doc! {
                 "$addFields":{
