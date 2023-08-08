@@ -67,7 +67,7 @@ mod test {
         let collection = get_collection("test_consume_task").await;
         let consume_func = TestConsumeFunc {};
         let worker_id = "aaa";
-        let mut task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         task_producer.send_task("111", 1, None).await.expect("failed to send task");
@@ -84,7 +84,7 @@ mod test {
         let collection = get_collection("test_consume_string_task").await;
         let consume_func = TestStringConsumeFunc {};
         let worker_id = "aaa";
-        let mut task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         task_producer.send_task("111", "test".to_string(), None).await.expect("failed to send task");
@@ -101,7 +101,7 @@ mod test {
         let collection = get_collection("test_consume_fail_task").await;
         let consume_func = TestConsumeFailFunc {};
         let worker_id = "aaa";
-        let mut task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         task_producer.send_task("111", 1, None).await.expect("failed to send task");
@@ -118,9 +118,9 @@ mod test {
     pub async fn test_multiple_consume_task() {
         let collection = get_collection("test_multiple_consume_task").await;
         let worker_id1 = "aaa";
-        let mut task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         let worker_id2 = "bbb";
-        let mut task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer");
+        let task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         tokio::spawn(async move { task_consumer2.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
@@ -139,9 +139,9 @@ mod test {
     pub async fn test_partial_success_multiple_consume_task() {
         let collection = get_collection("test_partial_success_multiple_consume_task").await;
         let worker_id1 = "aaa";
-        let mut task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFailFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFailFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         let worker_id2 = "bbb";
-        let mut task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer");
+        let task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         tokio::spawn(async move { task_consumer2.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
@@ -165,7 +165,7 @@ mod test {
     pub async fn test_consume_task_worker_id() {
         let collection = get_collection("test_consume_task_worker_priority").await;
         let worker_id1 = "aaa";
-        let mut task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
 
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
@@ -184,7 +184,7 @@ mod test {
             .worker_id(worker_id2)
             .build();
         assert_eq!(config2.get_worker_id(), worker_id2);
-        let mut task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, config2).await.expect("failed to create consumer");
+        let task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, config2).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer2.start().await });
         tokio::time::sleep(Duration::from_secs(1)).await;
         // task should be consumed
@@ -203,7 +203,7 @@ mod test {
         task_producer.send_task("112", 0, None).await.expect("failed to send task");
         let worker_id = "aaa";
         // start the consumer
-        let mut task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         // wait for the consumer to complete all tasks
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -226,7 +226,7 @@ mod test {
         task_producer.send_task("111", 3, None).await.expect("failed to send task");
         let worker_id = "aaa";
         // start the consumer
-        let mut task_consumer = TaskConsumer::create(collection.clone(), TestConsumeWithTimeParamFunc {}, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
+        let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeWithTimeParamFunc {}, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
         // wait for the consumer to occupy the task
         tokio::time::sleep(Duration::from_secs(1)).await;

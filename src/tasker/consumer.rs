@@ -64,7 +64,7 @@ pub struct TaskState<K: Send> {
 }
 
 impl<K: Send + 'static> TaskState<K> {
-    pub fn run<T: Send + Clone + 'static, Func: TaskConsumerFunc<T, K>>(arc: Arc<Func>, params: Option<T>, sender: Sender<String>, key: String) -> TaskState<K> {
+    fn run<T: Send + Clone + 'static, Func: TaskConsumerFunc<T, K>>(arc: Arc<Func>, params: Option<T>, sender: Sender<PostHandling>, key: String) -> TaskState<K> {
         let handler = tokio::spawn({
             let arc = arc.clone();
             let params = params.clone();
@@ -85,7 +85,7 @@ impl<K: Send + 'static> TaskState<K> {
                         Err(UnknownError)
                     }
                 };
-                if let Err(e) = sender.send(key).await {
+                if let Err(e) = sender.send(PostHandling { key: key.as_str().to_string() }).await {
                     error!("failed to send task state update message {}",&e);
                 }
                 result
@@ -97,15 +97,16 @@ impl<K: Send + 'static> TaskState<K> {
     }
 }
 
-pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
-    marker: PhantomData<Task<T, K>>,
+pub struct SharedConsumerState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     collection: Collection<Task<T, K>>,
     func: Arc<Func>,
     config: TaskConsumerConfig,
-    queue: Mutex<DelayQueue<String>>,
     task_map: Mutex<HashMap<String, TaskState<K>>>,
-    sender: Sender<String>,
-    receiver: Mutex<Receiver<String>>,
+}
+
+pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
+    marker: PhantomData<Task<T, K>>,
+    state: Arc<SharedConsumerState<T, K, Func>>,
 }
 
 #[derive(Deserialize)]
@@ -114,140 +115,168 @@ struct NextDoc {
     pub start_time: DateTime,
 }
 
+#[derive(Deserialize)]
+struct PostHandling {
+    pub key: String,
+}
+
+#[derive(Deserialize)]
+struct FetchLoopDoc {}
+
 impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send> TaskConsumer<T, K, Func> {
     pub async fn create(collection: Collection<Task<T, K>>, func: Func, config: TaskConsumerConfig) -> MResult<Self> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(10);
-        let consumer = TaskConsumer {
-            marker: Default::default(),
+        let shared_consumer_state = SharedConsumerState {
             collection,
             func: Arc::new(func),
             config,
-            queue: Default::default(),
-            task_map: Default::default(),
-            sender,
-            receiver:Mutex::new(receiver),
+            task_map: Mutex::new(Default::default()),
+        };
+        let consumer = TaskConsumer {
+            marker: Default::default(),
+            state: Arc::new(shared_consumer_state),
         };
         Ok(consumer)
     }
 
-    pub fn add2queue(&self, key: String, run_time: DateTime) {
+    pub fn add2queue(key: String, run_time: DateTime, queue: &Mutex<DelayQueue<String>>) {
         let diff = run_time.timestamp_millis() - DateTime::now().timestamp_millis();
         trace!("add key {} to wait queue",&key);
         if diff <= 0 {
-            self.queue.lock().unwrap().insert(key, Duration::ZERO);
+            queue.lock().unwrap().insert(key, Duration::ZERO);
         } else {
             // diff max at about 2 years, we limit it to 1000 seconds
-            self.queue.lock().unwrap().insert(key, Duration::from_millis(diff.min(1_000_000) as u64));
+            queue.lock().unwrap().insert(key, Duration::from_millis(diff.min(1_000_000) as u64));
         }
     }
 
-    pub async fn start(&mut self) {
-        // 1. TODO: fetch worker config
-        // 2. start change stream
-        let mut change_stream = self.gen_change_stream().await.unwrap();
-        // init next_run_time
-        let filter = Self::gen_pipeline(&self.config);
-        let pipeline = [filter];
-        {
-            let mut cursor = self.collection.aggregate(pipeline.clone(), None).await.unwrap();
-            for _ in 0..10 {
-                if let Some(Ok(task)) = cursor.next().await {
-                    let task = from_document::<Task<T, K>>(task).unwrap();
-                    self.add2queue(task.key, task.task_state.start_time);
-                } else {
-                    break;
-                }
-            }
-        }
-        trace!("start to wait for change stream, worker_id={}", self.config.get_worker_id());
-        // 3. wait to consume task at next_run_time
+    pub async fn start(self: &Self) {
+        let (next_doc_sender, next_doc_receiver) = tokio::sync::mpsc::channel(10);
+        let (post_handling_sender, post_handling_receiver) = tokio::sync::mpsc::channel(10);
+        let (fetch_loop_sender, fetch_loop_receiver) = tokio::sync::mpsc::channel(10);
+
+        // start post handling process loop
+        let handle1 = tokio::spawn(Self::start_post_running(self.state.clone(), post_handling_receiver));
+        // listen to change stream to update occupy queue
+        let handle2 = tokio::spawn(Self::start_listen2change_stream(self.state.clone(), next_doc_sender.clone()));
+        // start task processing loop, this loop spawn actual task running closure
+        let handle3 = tokio::spawn(Self::start_process_loop(self.state.clone(), next_doc_receiver, post_handling_sender.clone(), fetch_loop_sender.clone()));
+        // start watch dog loop
+        let handle4 = tokio::spawn(Self::start_task_fetcher(self.state.clone(), next_doc_sender.clone(), fetch_loop_receiver));
+        let _ = tokio::join!(handle1, handle2, handle3, handle4);
+    }
+
+
+    async fn start_listen2change_stream(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>) {
         loop {
+            trace!("start_listen2change_stream");
+            let mut change_stream = Self::gen_change_stream(&state.config, &state.collection).await.unwrap();
+            while let Some(result) = change_stream.next().await {
+                match result {
+                    Ok(change_event) => {
+                        match change_event.full_document {
+                            None => {
+                                warn!("full document not provided");
+                            }
+                            Some(doc) => {
+                                next_doc_sender.send(doc).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("change stream failed {}",e);
+                        break;
+                    }
+                }
+            }
+            warn!("change stream exits");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    async fn start_process_loop(state: Arc<SharedConsumerState<T, K, Func>>, mut next_doc_receiver: Receiver<NextDoc>, post_handling_sender: Sender<PostHandling>, fetch_loop_sender: Sender<FetchLoopDoc>) {
+        let mut queue = DelayQueue::<String>::new();
+        loop {
+            trace!("start_process_loop");
             tokio::select! {
-                change_stream_result = change_stream.next()=>{
-                    match change_stream_result{
-                        Some(result)=>{
-                            match result {
-                                Ok(change_event) => {
-                                    match change_event.full_document {
-                                        None => {
-                                            warn!("full document not provided");
-                                        }
-                                        Some(doc) => {
-                                            self.add2queue(doc.key, doc.start_time)
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("change stream failed {}",e);
-                                    return;
-                                }
-                            }
-                        }
-                        None=>{
-                            warn!("change stream returns None");
-                        }
+                Some(expired)=futures::future::poll_fn(|cx| queue.poll_expired(cx))=>{
+                    Self::try_occupy_task(state.clone(), expired, post_handling_sender.clone()).await;
+                    if queue.is_empty(){
+                        trace!("queue empty, check remaining tasks");
+                        // emit signal to fetch more tasks
+                        fetch_loop_sender.send(FetchLoopDoc{}).await;
                     }
                 }
-                Some(expired)=futures::future::poll_fn(|cx| self.queue.lock().unwrap().poll_expired(cx))=>{
-                    self.try_occupy_task(expired).await;
-                    if {self.queue.lock().unwrap().is_empty()}{
-                        trace!("queue empty, check remaining documents");
-                        let mut cursor = self.collection.aggregate(pipeline.clone(), None).await.unwrap();
-                        for _ in 0..10 {
-                            if let Some(Ok(task)) = cursor.next().await {
-                                let task = from_document::<Task<T, K>>(task).unwrap();
-                                self.add2queue(task.key, task.task_state.start_time);
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Some(key)=self.receiver.lock().unwrap().recv()=>{
-                    trace!("handling post running");
-                    if let Err(e)=self.post_running(key).await{
-                        error!("failed to execute post running {}",&e);
-                    }
+                Some(doc)=next_doc_receiver.recv()=>{
+                    trace!("handling new doc");
+                    let diff = doc.start_time.timestamp_millis() - DateTime::now().timestamp_millis();
+                    let duration=if diff>0{
+                        Duration::from_millis(diff.min(1_000_000) as u64)
+                    }else{
+                        Duration::ZERO
+                    };
+                    queue.insert(doc.key, duration);
                 }
             }
         }
     }
 
-    pub fn is_task_running(&self, key: impl AsRef<str>) -> bool {
-        self.task_map.lock().unwrap().contains_key(key.as_ref())
+    async fn start_task_fetcher(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>, mut fetch_loop_receiver: Receiver<FetchLoopDoc>) {
+        trace!("start_task_fetcher");
+        let filter = Self::gen_pipeline(&state.config);
+        let pipeline = [filter];
+        Self::fetch_more_task(state.clone(), next_doc_sender.clone(), pipeline.clone()).await;
+        while let Some(_) = fetch_loop_receiver.recv().await {
+            Self::fetch_more_task(state.clone(), next_doc_sender.clone(), pipeline.clone()).await;
+        }
     }
 
-    async fn post_running(&self, key: String) -> MResult<()> {
-        trace!("start to post handling key {} worker_id {}", key, self.config.get_worker_id());
-        // 1. check task state
-        let task_state = match self.task_map.lock().unwrap().remove(&key) {
-            None => {
-                error!("failed to get task state for key {}", &key);
-                return Err(NoTaskMatched);
+    async fn fetch_more_task(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>, pipeline: [Document; 1]) {
+        trace!("start fetch more docs");
+        let mut cursor = state.collection.aggregate(pipeline.clone(), None).await.unwrap();
+        // add first 10 tasks to queue
+        for _ in 0..10 {
+            if let Some(Ok(task)) = cursor.next().await {
+                let task = from_document::<Task<T, K>>(task).unwrap();
+                let next_doc = NextDoc { key: task.key, start_time: task.task_state.start_time };
+                next_doc_sender.send(next_doc).await;
+            } else {
+                break;
             }
-            Some(v) => { v }
-        };
-        // 2. update its state based on running result
-        if !task_state.handler.is_finished() {
-            warn!("task state is not finished during post running, key={}",key);
         }
-        let handle_result = match task_state.handler.await.unwrap() {
-            Ok(returns) => {
-                self.mark_task_success(key, returns).await
+    }
+
+    async fn start_post_running(state: Arc<SharedConsumerState<T, K, Func>>, mut post_handling_receiver: Receiver<PostHandling>) {
+        trace!("start_post_running");
+        while let Some(PostHandling { key }) = post_handling_receiver.recv().await {
+            trace!("start to post handling key {} worker_id {}", key, state.config.get_worker_id());
+            // 1. check task state
+            let task_state = match state.task_map.lock().unwrap().remove(&key) {
+                None => {
+                    error!("failed to get task state for key {}", &key);
+                    continue;
+                }
+                Some(v) => { v }
+            };
+            // 2. update its state based on running result
+            if !task_state.handler.is_finished() {
+                warn!("task is not finished before post running, key={}",&key);
             }
-            Err(e) => {
-                self.mark_task_failed(key, e).await
-            }
-        };
-        // TODO: 3. notify outside components
-        handle_result
+            let handle_result = match task_state.handler.await.unwrap() {
+                Ok(returns) => {
+                    Self::mark_task_success(state.clone(), &key, returns).await
+                }
+                Err(e) => {
+                    Self::mark_task_failed(state.clone(), &key, e).await
+                }
+            };
+        }
     }
 
     // update worker state to success if not already success
-    async fn mark_task_success(&self, key: String, returns: K) -> MResult<()> {
+    async fn mark_task_success(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, returns: K) -> MResult<()> {
         let query = doc! {
-            "key":&key,
-            "task_state.worker_states.worker_id": self.config.get_worker_id()
+            "key":key.as_ref(),
+            "task_state.worker_states.worker_id": state.config.get_worker_id()
         };
         let update = doc! {
             "$currentDate":{
@@ -260,23 +289,23 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 "task_state.worker_states.$.fail_time": "",
             }
         };
-        match self.collection.update_one(query, update, None).await {
+        match state.collection.update_one(query, update, None).await {
             Ok(v) => {
                 if v.modified_count == 0 {
-                    error!("failed to set task {} to success", &key);
+                    error!("failed to set task {} to success", key.as_ref());
                     Err(NoTaskMatched)
                 } else {
-                    trace!("set task {} to success", &key);
+                    trace!("set task {} to success", key.as_ref());
                     Ok(())
                 }
             }
             Err(e) => {
-                error!("failed to set task {} to success, {}", &key, &e);
+                error!("failed to set task {} to success, {}", key.as_ref(), &e);
                 Err(MongoDbError(e.into()))
             }
         }
     }
-    async fn mark_task_failed(&self, key: String, e: MSchedulerError) -> MResult<()> {
+    async fn mark_task_failed(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, e: MSchedulerError) -> MResult<()> {
         let update = if let ExecutionError(_) = e {
             doc! {
                 "$currentDate":{"task_state.worker_states.$.fail_time": true},
@@ -301,27 +330,27 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             }
         };
         let query = doc! {
-                "key": &key,
-                "task_state.worker_states.worker_id": self.config.get_worker_id()
+                "key": key.as_ref(),
+                "task_state.worker_states.worker_id": state.config.get_worker_id()
             };
-        match self.collection.update_one(query, update, None).await {
+        match state.collection.update_one(query, update, None).await {
             Ok(v) => {
                 if v.modified_count == 0 {
-                    error!("failed to set task {} to failed", &key);
+                    error!("failed to set task {} to failed", key.as_ref());
                     Err(NoTaskMatched)
                 } else {
-                    trace!("set task {} to fail", &key);
+                    trace!("set task {} to fail", key.as_ref());
                     Ok(())
                 }
             }
             Err(e) => {
-                error!("failed to set task {} to fail, {}", &key, &e);
+                error!("failed to set task {} to fail, {}", key.as_ref(), &e);
                 Err(MongoDbError(e.into()))
             }
         }
     }
 
-    async fn try_occupy_task(&self, expired: Expired<String>) {
+    async fn try_occupy_task(state: Arc<SharedConsumerState<T, K, Func>>, expired: Expired<String>, post_handling_sender: Sender<PostHandling>) {
         let deadline = expired.deadline();
         let key = expired.get_ref();
         if deadline + Duration::from_secs(100) < Instant::now() {
@@ -329,14 +358,14 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             return;
         }
         // otherwise we try to occupy this task
-        match self.occupy_task(key).await {
+        match Self::occupy_task(state.clone(), key).await {
             Ok(task) => {
                 // save task state and run it
                 let params = task.params.clone();
-                let arc = self.func.clone();
-                let task_state = TaskState::run(arc, params, self.sender.clone(), task.key.clone());
+                let arc = state.func.clone();
+                let task_state = TaskState::run(arc, params, post_handling_sender, task.key.clone());
                 trace!("success to occupy task key {}",&key);
-                { self.task_map.lock().unwrap().insert(task.key.clone(), task_state); }
+                { state.task_map.lock().unwrap().insert(task.key.clone(), task_state); }
             }
             Err(MongoDbError(e)) => {
                 error!("failed to occupy task error={}",e);
@@ -348,8 +377,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn occupy_task(&self, key: impl AsRef<str>) -> MResult<Task<T, K>> {
-        let worker_id = self.config.get_worker_id();
+    async fn occupy_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>) -> MResult<Task<T, K>> {
+        let worker_id = state.config.get_worker_id();
         let filter = doc! {
                 "$and":[
                     // check for certain key
@@ -360,7 +389,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                      {
                         "$or": [
                             { "task_option.min_worker_version": { "$exists": false } },
-                            { "task_option.min_worker_version": { "$lte": &self.config.get_worker_version() } },
+                            { "task_option.min_worker_version": { "$lte": &state.config.get_worker_version() } },
                         ]
                     },
                     // check specific worker
@@ -432,7 +461,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         update_options.sort = Some(doc! {"task_option.priority": -1});
         update_options.return_document = Some(ReturnDocument::After);
         // update_options.projection = Some( {"task_state": 1});
-        match self.collection.find_one_and_update(
+        match state.collection.find_one_and_update(
             filter, update, Some(update_options),
         ).await {
             Ok(Some(task)) => {
@@ -447,7 +476,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn gen_change_stream(&self) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
+    async fn gen_change_stream(config: &TaskConsumerConfig, collection: &Collection<Task<T, K>>) -> MResult<ChangeStream<ChangeStreamEvent<NextDoc>>> {
         let pipeline = [
             doc! {
                 "$addFields":{
@@ -456,7 +485,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 }
             },
             // only consider the task we can run
-            Self::gen_pipeline(&self.config),
+            Self::gen_pipeline(config),
             doc! {
                 "$project":{
                     // _id cannot get filtered, will get error if filtered
@@ -470,7 +499,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         ];
         let mut change_stream_options = ChangeStreamOptions::default();
         change_stream_options.full_document = Some(FullDocumentType::UpdateLookup);
-        match self.collection.clone_with_type::<NextDoc>().watch(pipeline, Some(change_stream_options)).await {
+        match collection.clone_with_type::<NextDoc>().watch(pipeline, Some(change_stream_options)).await {
             Ok(v) => {
                 Ok(v)
             }
