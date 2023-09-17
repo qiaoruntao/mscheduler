@@ -58,3 +58,11 @@ pub struct Task<T, K> {
     // task parameters
     pub params: Option<T>,
 }
+
+/// use this struct to find problematic tasks and mark them as failed
+#[derive(Deserialize, Serialize)]
+pub struct TaskBasicInfo<K> {
+    pub key: String,
+    pub task_option: Option<TaskOption>,
+    pub task_state: Option<TaskState<K>>,
+}

@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 use typed_builder::TypedBuilder;
 
 use crate::tasker::error::{MResult, MSchedulerError};
@@ -529,18 +529,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     },
                     // not already occupied
                     {
-                        "$expr": {
-                        // running worker cnt+finished worker cnt<concurrent_worker_cnt
-                            "$eq": [{
-                                "$size": {
-                                    "$filter": {
-                                        "input": "$task_state.worker_states",
-                                        "as": "item",
-                                        "cond": { "$eq": ["$$item.worker_id", config.get_worker_id()] }
-                                    }
-                                }
-                            }, 0]
-                        }
+                        "task_state.worker_states.worker_id":{"$ne":config.get_worker_id()}
                     },
                     // has worker space remains
                      {
