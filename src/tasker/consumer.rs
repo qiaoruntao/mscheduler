@@ -62,7 +62,7 @@ impl<K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static> TaskState<
             let arc = state.func.clone();
             let params = task.params.clone();
             let ping_handler = tokio::spawn(Self::handle_ping_logic(state.clone(), task.key.clone(), task.task_option.ping_interval_ms));
-            /// consumer logic 需要在ping logic之前结束, 否则报错
+            // TODO: consumer logic 需要在ping logic之前结束, 否则报错
             async move {
                 let result = Self::handle_consumer_logic(arc, params).await;
                 if ping_handler.is_finished() {
@@ -260,7 +260,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             trace!("start_process_loop");
             tokio::select! {
                 Some(expired)=futures::future::poll_fn(|cx| queue.poll_expired(cx))=>{
-                    if let Some(key)=key_map.remove(expired.get_ref()){
+                    if let Some(_)=key_map.remove(expired.get_ref()){
                         trace!("key_map removes expired key {}", expired.get_ref());
                     }else{
                         error!("key_map failed to remove expired key {}", expired.get_ref());
@@ -274,7 +274,9 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     if queue.is_empty(){
                         trace!("queue empty, check remaining tasks");
                         // emit signal to fetch more tasks
-                        fetch_loop_sender.send(FetchLoopDoc{}).await;
+                        if let Err(e)=fetch_loop_sender.send(FetchLoopDoc{}).await{
+                            error!(worker_id=state.config.worker_id, "failed to send fetch loop request {}",e);
+                        }
                     }
                 }
                 Some(doc)=next_doc_receiver.recv()=>{
@@ -315,7 +317,9 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             if let Some(Ok(task)) = cursor.next().await {
                 let task = from_document::<Task<T, K>>(task).unwrap();
                 let next_doc = NextDoc { key: task.key, start_time: task.task_state.start_time };
-                next_doc_sender.send(next_doc).await;
+                if let Err(e) = next_doc_sender.send(next_doc).await {
+                    error!(worker_id=state.config.worker_id, "failed to send next doc {}",e);
+                }
             } else {
                 break;
             }
@@ -455,7 +459,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    #[instrument(skip_all, key = key.as_ref())]
+    #[instrument(skip_all, fields(key = key.as_ref()))]
     async fn ping_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>) -> MResult<()> {
         trace!("start to ping task {}", key.as_ref());
         // check if already occupied

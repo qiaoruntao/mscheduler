@@ -1,8 +1,13 @@
 use mongodb::bson::DateTime;
 use serde::{Deserialize, Serialize};
 
+/// 记录worker的一次执行, 便于记录失败次数和简化状态流转
+/// 约束: 同一个worker不能有两个RUNNING状态的info, 用running_id区分和更新不同的info
+/// running_id由worker确保唯一,不在其他地方记录
 #[derive(Deserialize, Serialize)]
-pub struct TaskWorkerState<K> {
+pub struct TaskWorkerRunningInfo<K> {
+    // use to identify running info
+    pub running_id: Option<String>,
     // worker identifier
     pub worker_id: String,
     // when can other workers accept this task
@@ -17,6 +22,7 @@ pub struct TaskWorkerState<K> {
     pub returns: Option<K>,
 }
 
+/// record task state info, including all worker states and some generic task info
 #[derive(Deserialize, Serialize)]
 pub struct TaskState<K> {
     // when did this task created
@@ -24,9 +30,10 @@ pub struct TaskState<K> {
     // when should this task run
     pub start_time: DateTime,
     // worker ids of which are running this task
-    pub worker_states: Vec<TaskWorkerState<K>>,
+    pub worker_states: Vec<TaskWorkerRunningInfo<K>>,
 }
 
+/// record how task sender specify how to run this task
 #[derive(Deserialize, Serialize)]
 pub struct TaskOption {
     // priority

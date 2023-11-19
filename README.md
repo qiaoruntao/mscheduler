@@ -18,8 +18,72 @@
 1. 任务的发布和执行
 2. 多个worker同时运行任务
 3. 任务失败后重试
-4. worker超时后由其他任务抢占
+4. worker ping超时后其他worker可以抢占任务
 5. 
+
+## 核心模型
+Task
+1. TaskState
+   1. 整体任务状态参数
+   2. Vec\<TaskWorkerState\>
+2. TaskOption
+3. \<T\>参数
+
+任务中worker state的状态转换
+1. INIT 刚发送
+2. RUNNING 被worker占领并执行中
+3. SUCCESS worker执行成功
+4. FAIL worker执行失败
+
+## 功能设计
+### 任务发送
+不变
+### 任务消费
+
+**如何发现任务**
+
+1. 启动时主动查询一批任务
+2. 通过change stream 订阅一批发生变化的任务
+3. 任务列表空时主动查询一批任务
+
+**查询什么任务**
+
+1. INIT=》需要抢占
+2. RUNNING=》等待超时后抢占
+3. 其他worker执行失败,但是符合抢占条件=》走复杂判断逻辑
+
+**按什么优先级查询任务**
+
+目前没有特殊要求, 按任意key顺序查询
+
+**如何判断任务是否可抢占**
+1. 任务参数限制不可执行
+   1. specific_worker_ids限制不可执行
+2. 其他worker状态限制
+   1. ping_expire_time没到, 不可抢占
+   2. 其他worker info占据了并发执行数量
+      1. max_unexpected_retries超出限制, 不执行. 约束: max_unexpected_retries\<failed worker info cnt
+      2. concurrent_worker_cnt限制并行执行数量. 约束: concurrent_worker_cnt\<running worker cnt &&  concurrent_worker_cnt\<success worker info cnt
+
+**抢占的流程**
+1. 启动前使用change stream监听. 启动后查询一批任务, 查询条件: 任务参数允许worker执行 && 任务没有完全成功或失败(根据info cnt数量确定).
+2. 查询后读取worker info状态, 用于判断抢占时间点
+3. 遍历这些任务, 计算任务可抢占的时间点. 设置定时任务在这些时间点进行抢占. PriorityQueue实现, 有最大长度限制.
+4. 如果可抢占任务为空, 那么重新查询一批任务直到没有数据返回. 之后完全可以通过change stream监听
+
+**执行的流程**
+1. 通过tokio::spawn隔离报错
+2. 按option里的设置持续ping
+3. 任务失败/成功后更新任务状态
+
+**任务失败的报错**
+没有特殊需求, 保持原样
+
+**模块划分**
+1. stream监听. 始终存在
+2. 批量读取任务. 读取完成后可退出, 直到stream监听报错为止(存在时间gap, 无法判断是否存在新更新的任务). 所以这个由stream监听线程启动
+3. 任务抢占. 监听和批量读取后通过该线程维护PriorityQueue, 并执行任务抢占
+4. 任务执行. 任务抢占后spawn任务并执行. 执行过程中维护执行handler的状态. 任务完成后负责更新任务状态
 
 ## 测试用例
 1. 一个worker, 持续运行, 
