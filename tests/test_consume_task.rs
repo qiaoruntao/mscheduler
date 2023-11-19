@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tracing::info;
 
 use mscheduler::tasker::consumer::TaskConsumerFunc;
 use mscheduler::tasker::error::MResult;
 use mscheduler::tasker::error::MSchedulerError;
+use mscheduler::tasker::error::MSchedulerError::ExecutionError;
 
 mod common;
 
@@ -39,12 +41,20 @@ impl TaskConsumerFunc<i32, i32> for TestConsumeFailFunc {
 struct TestConsumeWithTimeParamFunc {}
 
 #[async_trait]
-impl TaskConsumerFunc<u64, u64> for TestConsumeWithTimeParamFunc {
-    async fn consume(&self, time: Option<u64>) -> MResult<u64> {
+impl TaskConsumerFunc<i64, i64> for TestConsumeWithTimeParamFunc {
+    async fn consume(&self, time: Option<i64>) -> MResult<i64> {
         if let Some(wait_time) = time {
-            tokio::time::sleep(Duration::from_secs(wait_time)).await;
+            info!("start to wait {} seconds", wait_time.abs());
+            tokio::time::sleep(Duration::from_secs(wait_time.abs() as u64)).await;
         }
-        Ok(time.unwrap_or(0))
+        info!("task consumed");
+
+        let value = time.unwrap_or(0);
+        if value > 0 {
+            Ok(value)
+        } else {
+            Err(ExecutionError(Box::new(format!("minus value as error {}", value))))
+        }
     }
 }
 
@@ -60,11 +70,11 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
 
     use crate::{TestConsumeFailFunc, TestConsumeFunc, TestConsumeWithTimeParamFunc, TestStringConsumeFunc};
-    use crate::common::get_collection;
+    use crate::common::get_collection_for_test;
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_task() {
-        let collection = get_collection("test_consume_task").await;
+        let collection = get_collection_for_test("test_consume_task").await;
         let consume_func = TestConsumeFunc {};
         let worker_id = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
@@ -81,7 +91,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_string_task() {
-        let collection = get_collection("test_consume_string_task").await;
+        let collection = get_collection_for_test("test_consume_string_task").await;
         let consume_func = TestStringConsumeFunc {};
         let worker_id = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
@@ -98,7 +108,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_fail_task() {
-        let collection = get_collection("test_consume_fail_task").await;
+        let collection = get_collection_for_test("test_consume_fail_task").await;
         let consume_func = TestConsumeFailFunc {};
         let worker_id = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), consume_func, TaskConsumerConfig::builder().worker_id(worker_id).build()).await.expect("failed to create consumer");
@@ -116,7 +126,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_multiple_consume_task() {
-        let collection = get_collection("test_multiple_consume_task").await;
+        let collection = get_collection_for_test("test_multiple_consume_task").await;
         let worker_id1 = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         let worker_id2 = "bbb";
@@ -137,7 +147,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_partial_success_multiple_consume_task() {
-        let collection = get_collection("test_partial_success_multiple_consume_task").await;
+        let collection = get_collection_for_test("test_partial_success_multiple_consume_task").await;
         let worker_id1 = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFailFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         let worker_id2 = "bbb";
@@ -163,7 +173,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_task_worker_id() {
-        let collection = get_collection("test_consume_task_worker_priority").await;
+        let collection = get_collection_for_test("test_consume_task_worker_priority").await;
         let worker_id1 = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
@@ -196,7 +206,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_continuous() {
-        let collection = get_collection("test_consume_continuous").await;
+        let collection = get_collection_for_test("test_consume_continuous").await;
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         // init collection with some tasks
         task_producer.send_task("111", 0, None).await.expect("failed to send task");
@@ -220,7 +230,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_no_update_tasks() {
-        let collection = get_collection("test_consume_no_update_tasks").await;
+        let collection = get_collection_for_test("test_consume_no_update_tasks").await;
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         // init collection with some tasks
         task_producer.send_task("111", 3, None).await.expect("failed to send task");
@@ -244,5 +254,44 @@ mod test {
         let send_result = task_producer.send_task("111", 1, None).await;
         assert!(send_result.is_ok(), "send task expected to success");
         assert!(send_result.unwrap().update_existing, "send task should update existing task");
+    }
+
+    #[test_log::test(tokio::test)]
+    pub async fn test_ping_task() {
+        let collection = get_collection_for_test("test_ping_task").await;
+        let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
+        // init collection with some tasks
+        let send_task_option = SendTaskOption::builder().ping_interval_ms(1000_u32).build();
+        task_producer.send_task("111", -5, Some(send_task_option)).await.expect("failed to send task");
+        let worker_id01 = "aaa";
+        // start the consumer
+        let task_consumer1 = TaskConsumer::create(collection.clone(), TestConsumeWithTimeParamFunc {}, TaskConsumerConfig::builder().worker_id(worker_id01).build()).await.expect("failed to create consumer01");
+        tokio::spawn({
+            let task_consumer1 = task_consumer1.clone();
+            async move { task_consumer1.start().await }
+        });
+        // wait for the consumer to occupy the task
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // create another consumer, this consumer should not acquire this task before it fails
+        let worker_id02 = "bbb";
+        let task_consumer2 = TaskConsumer::create(collection.clone(), TestConsumeWithTimeParamFunc {}, TaskConsumerConfig::builder().worker_id(worker_id02).build()).await.expect("failed to create consumer02");
+        tokio::spawn({
+            let task_consumer2 = task_consumer2.clone();
+            async move { task_consumer2.start().await }
+        });
+        // task should be running
+        let task_time01 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").expect("failed to get task");
+        let first_ping_expire_time = task_time01.task_state.worker_states.get(0).unwrap().ping_expire_time;
+        // wait for a while and check ping time again
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let task_time02 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").expect("failed to get task");
+        let second_ping_expire_time = task_time02.task_state.worker_states.get(0).unwrap().ping_expire_time;
+        assert_ne!(first_ping_expire_time, second_ping_expire_time, "ping expire time not updated");
+        assert_eq!(task_consumer1.get_running_task_cnt(), 1);
+        assert_eq!(task_consumer2.get_running_task_cnt(), 0);
+        // wait for the task to fail and consumer2 should handle it
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(task_consumer1.get_running_task_cnt(), 0);
+        assert_eq!(task_consumer2.get_running_task_cnt(), 1);
     }
 }

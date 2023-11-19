@@ -14,6 +14,16 @@
 
 [actions-url]: https://github.com/qiaoruntao/mscheduler/actions?query=branch%3Amaster
 
+## 功能点
+1. 任务的发布和执行
+2. 多个worker同时运行任务
+3. 任务失败后重试
+4. worker超时后由其他任务抢占
+5. 
+
+## 测试用例
+1. 一个worker, 持续运行, 
+
 | Feature                    |      Bull       | Agenda |
 |:---------------------------|:---------------:|:------:|
 | Backend                    |      redis      | mongo  |

@@ -5,7 +5,7 @@ use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ResolverConfig};
 use mscheduler::tasker::task_common::ensure_index;
 
-pub async fn get_collection<T>(collection_name: impl AsRef<str>) -> Collection<T> {
+pub async fn get_collection_for_test<T>(collection_name: impl AsRef<str>) -> Collection<T> {
     let connection_str = env::var("MongoStr").expect("need mongodb connection str");
     let client_options = if cfg!(windows) && connection_str.contains("+srv") {
         ClientOptions::parse_with_resolver_config(connection_str, ResolverConfig::quad9()).await.unwrap()

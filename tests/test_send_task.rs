@@ -7,11 +7,11 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task_common::ensure_index;
 
-    use crate::common::get_collection;
+    use crate::common::get_collection_for_test;
 
     #[tokio::test]
     async fn test_send_new_task() {
-        let collection = get_collection("test_send_new_task").await;
+        let collection = get_collection_for_test("test_send_new_task").await;
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
@@ -29,7 +29,7 @@ mod test {
 
     #[tokio::test]
     async fn test_send_duplicate_task() {
-        let collection = get_collection("test_send_duplicate_task").await;
+        let collection = get_collection_for_test("test_send_duplicate_task").await;
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 

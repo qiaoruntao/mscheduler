@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, instrument, trace, warn};
 use typed_builder::TypedBuilder;
 
 use crate::tasker::error::{MResult, MSchedulerError};
@@ -56,15 +56,21 @@ pub struct TaskState<K: Send> {
     handler: JoinHandle<MResult<K>>,
 }
 
-impl<K: Send + 'static> TaskState<K> {
-    fn run<T: Send + Clone + 'static, Func: TaskConsumerFunc<T, K>>(arc: Arc<Func>, params: Option<T>, sender: Sender<PostHandling>, key: String) -> TaskState<K> {
+impl<K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static> TaskState<K> {
+    fn run<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, Func: TaskConsumerFunc<T, K>>(state: Arc<SharedConsumerState<T, K, Func>>, sender: Sender<PostHandling>, task: Task<T, K>) -> TaskState<K> {
         let handler = tokio::spawn({
-            let arc = arc.clone();
-            let params = params.clone();
+            let arc = state.func.clone();
+            let params = task.params.clone();
+            let ping_handler = tokio::spawn(Self::handle_ping_logic(state.clone(), task.key.clone(), task.task_option.ping_interval_ms));
+            /// consumer logic 需要在ping logic之前结束, 否则报错
             async move {
                 let result = Self::handle_consumer_logic(arc, params).await;
-                // let ping_logic = Self::handle_ping_logic(&key).await;
-                if let Err(e) = sender.send(PostHandling { key: key.as_str().to_string() }).await {
+                if ping_handler.is_finished() {
+                    error!("ping handler exits before consumer logic is exited");
+                } else {
+                    ping_handler.abort();
+                }
+                if let Err(e) = sender.send(PostHandling { key: task.key }).await {
                     error!("failed to send task state update message {}",&e);
                 }
                 result
@@ -75,13 +81,21 @@ impl<K: Send + 'static> TaskState<K> {
         }
     }
 
-    async fn handle_ping_logic(key: impl AsRef<str>) {
-        loop{
-
-        }
+    async fn handle_ping_logic<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, Func: TaskConsumerFunc<T, K> + Send>(state: Arc<SharedConsumerState<T, K, Func>>, key: String, ping_interval_ms: u32) {
+        trace!("start to handle_ping_logic key={}, ping_interval_ms={}", &key, &ping_interval_ms);
+        loop {
+            tokio::time::sleep(Duration::from_millis(ping_interval_ms as u64)).await;
+            match TaskConsumer::ping_task(state.clone(), key.as_str()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("failed to update ping time for task key={} error={}", key.as_str(), &e);
+                }
+            }
+        };
     }
 
     async fn handle_consumer_logic<T: Send + Clone + 'static, Func: TaskConsumerFunc<T, K>>(arc: Arc<Func>, params: Option<T>) -> MResult<K> {
+        trace!("start to handle_consumer_logic");
         match tokio::spawn(async move { arc.consume(params).await }).catch_unwind().await {
             Ok(Ok(v)) => { v }
             Ok(Err(e)) => {
@@ -114,7 +128,16 @@ pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     state: Arc<SharedConsumerState<T, K, Func>>,
 }
 
-#[derive(Deserialize)]
+impl<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> Clone for TaskConsumer<T, K, Func> {
+    fn clone(&self) -> Self {
+        TaskConsumer {
+            marker: Default::default(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
 struct NextDoc {
     pub key: String,
     pub start_time: DateTime,
@@ -209,15 +232,18 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     Ok(change_event) => {
                         match change_event.full_document {
                             None => {
-                                warn!("full document not provided");
+                                warn!(worker_id=state.config.worker_id, "full document not provided");
                             }
                             Some(doc) => {
-                                next_doc_sender.send(doc).await;
+                                trace!(worker_id=state.config.worker_id, "doc received {:?}", &doc);
+                                if let Err(e) = next_doc_sender.send(doc).await {
+                                    error!("failed to send doc {}",e);
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        error!("change stream failed {}",e);
+                        error!(worker_id=state.config.worker_id, "change stream failed {}",e);
                         break;
                     }
                 }
@@ -229,10 +255,16 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     async fn start_process_loop(state: Arc<SharedConsumerState<T, K, Func>>, mut next_doc_receiver: Receiver<NextDoc>, post_handling_sender: Sender<PostHandling>, fetch_loop_sender: Sender<FetchLoopDoc>) {
         let mut queue = DelayQueue::<String>::new();
+        let mut key_map = HashMap::new();
         loop {
             trace!("start_process_loop");
             tokio::select! {
                 Some(expired)=futures::future::poll_fn(|cx| queue.poll_expired(cx))=>{
+                    if let Some(key)=key_map.remove(expired.get_ref()){
+                        trace!("key_map removes expired key {}", expired.get_ref());
+                    }else{
+                        error!("key_map failed to remove expired key {}", expired.get_ref());
+                    }
                     let max_task_cnt=state.max_tasks.load(Ordering::SeqCst);
                     // TODO: 一旦错过任务需要通过主动查询的方式重新获取任务
                     if max_task_cnt <= state.task_map.lock().unwrap().len() as u32 {
@@ -253,7 +285,13 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     }else{
                         Duration::ZERO
                     };
-                    queue.insert(doc.key, duration);
+                    if let Some(key)=key_map.get(&doc.key){
+                        if queue.try_remove(key).is_some(){
+                            trace!("remove task key={} before insert", &doc.key);
+                        }
+                    }
+                    let key=queue.insert(doc.key.clone(), duration);
+                    key_map.insert(doc.key, key);
                 }
             }
         }
@@ -261,15 +299,15 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     async fn start_task_fetcher(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>, mut fetch_loop_receiver: Receiver<FetchLoopDoc>) {
         trace!("start_task_fetcher");
-        let filter = Self::gen_pipeline(&state.config);
+        let filter = Self::gen_pipeline(&state.config, true);
         let pipeline = [filter];
-        Self::fetch_more_task(state.clone(), next_doc_sender.clone(), pipeline.clone()).await;
+        Self::fetch_more_task(state.clone(), next_doc_sender.clone(), &pipeline).await;
         while let Some(_) = fetch_loop_receiver.recv().await {
-            Self::fetch_more_task(state.clone(), next_doc_sender.clone(), pipeline.clone()).await;
+            Self::fetch_more_task(state.clone(), next_doc_sender.clone(), &pipeline).await;
         }
     }
 
-    async fn fetch_more_task(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>, pipeline: [Document; 1]) {
+    async fn fetch_more_task(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>, pipeline: &[Document; 1]) {
         trace!("start fetch more docs");
         let mut cursor = state.collection.aggregate(pipeline.clone(), None).await.unwrap();
         // add first 10 tasks to queue
@@ -400,11 +438,12 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         match Self::occupy_task(state.clone(), key).await {
             Ok(task) => {
                 // save task state and run it
-                let params = task.params.clone();
-                let arc = state.func.clone();
-                let task_state = TaskState::run(arc, params, post_handling_sender, task.key.clone());
-                trace!("success to occupy task key {}",&key);
-                { state.task_map.lock().unwrap().insert(task.key.clone(), task_state); }
+                let key = task.key.clone();
+                let task_state = TaskState::run(state.clone(), post_handling_sender, task);
+                trace!("successfully occupy task key {}",&key);
+                {
+                    state.task_map.lock().unwrap().insert(key, task_state);
+                }
             }
             Err(MongoDbError(e)) => {
                 error!("failed to occupy task error={}",e);
@@ -416,8 +455,32 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn ping_task(key: impl AsRef<str>) -> MResult<()> {
-        Ok(())
+    #[instrument(skip_all, key = key.as_ref())]
+    async fn ping_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>) -> MResult<()> {
+        trace!("start to ping task {}", key.as_ref());
+        // check if already occupied
+        let filter = doc! {
+            "key":key.as_ref(),
+            "task_state.worker_states.worker_id":&state.config.worker_id,
+        };
+        let update = doc! {
+            "$currentDate":{
+                "task_state.worker_states.$.ping_expire_time":true,
+            }
+        };
+        match state.collection.find_one_and_update(
+            filter, update, None,
+        ).await {
+            Ok(Some(_)) => {
+                Ok(())
+            }
+            Ok(None) => {
+                Err(NoTaskMatched)
+            }
+            Err(e) => {
+                Err(MongoDbError(e.into()))
+            }
+        }
     }
 
     async fn occupy_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>) -> MResult<Task<T, K>> {
@@ -527,8 +590,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     "task_option":"$fullDocument.task_option"
                 }
             },
-            // only consider the task we can run
-            Self::gen_pipeline(config),
+            // check both running and created tasks,
+            Self::gen_pipeline(config, false),
             doc! {
                 "$project":{
                     // _id cannot get filtered, will get error if filtered
@@ -552,7 +615,29 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    fn gen_pipeline(config: &TaskConsumerConfig) -> Document {
+    /// 根据指定条件生成对应的change stream pipeline
+    fn gen_pipeline(config: &TaskConsumerConfig, check_ping_time: bool) -> Document {
+        let task_state_filters = {
+            let mut temp = vec![
+                // success
+                doc! { "$ne": ["$$item.success_time", Bson::Null] },
+                // fail
+                doc! { "$ne": ["$$item.fail_time", Bson::Null] },
+            ];
+            if check_ping_time {
+                // running
+                temp.push(
+                    doc! {
+                        "$and":[
+                        { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
+                        { "$eq": ["$$item.success_time", Bson::Null] },
+                        { "$eq": ["$$item.fail_time", Bson::Null] },
+                        ]
+                    }
+                );
+            }
+            temp
+        };
         doc! {
             "$match":{
                 "$and":[
@@ -586,20 +671,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                                             "$filter": {
                                                 "input": "$task_state.worker_states",
                                                 "as": "item",
-                                                "cond": {"$or":[
-                                                    // running
-                                                    {
-                                                        "$and":[
-                                                            { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
-                                                            { "$eq": ["$$item.success_time", Bson::Null] },
-                                                            { "$eq": ["$$item.fail_time", Bson::Null] },
-                                                        ]
-                                                    },
-                                                    // success
-                                                    { "$ne": ["$$item.success_time", Bson::Null] },
-                                                    // fail
-                                                    { "$ne": ["$$item.fail_time", Bson::Null] }
-                                                ]}
+                                                "cond": {"$or":task_state_filters}
                                             }
                                         }
                                     }, "$task_option.concurrent_worker_cnt"]

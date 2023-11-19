@@ -5,6 +5,7 @@ use mongodb::options::UpdateOptions;
 use serde::Serialize;
 use tracing::{debug, error};
 use typed_builder::TypedBuilder;
+
 use crate::tasker::error::{MResult, MSchedulerError};
 use crate::tasker::task::{Task, TaskOption};
 
@@ -30,6 +31,8 @@ pub struct SendTaskOption {
     // do not find and do anything to a running task
     #[builder(default = true)]
     pub not_update_running: bool,
+    #[builder(default = 30_000)]
+    pub ping_interval_ms: u32,
     // clean up existing task's success worker states
     // pub clean_success: bool,
     // clean up existing task's failed worker states
@@ -73,7 +76,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
         let task_option = TaskOption {
             priority: 0,
             concurrent_worker_cnt: send_option.concurrency_cnt,
-            ping_interval_ms: 30_000,
+            ping_interval_ms: send_option.ping_interval_ms as u32,
             worker_timeout_ms: 60_000,
             min_worker_version: send_option.min_worker_version,
             specific_worker_ids: vec![],
