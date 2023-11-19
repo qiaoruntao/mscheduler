@@ -12,7 +12,7 @@ struct TestConsumeFunc {}
 
 #[async_trait]
 impl TaskConsumerFunc<i32, i32> for TestConsumeFunc {
-    async fn consumer(&self, params: Option<i32>) -> MResult<i32> {
+    async fn consume(&self, params: Option<i32>) -> MResult<i32> {
         Ok(params.unwrap_or(0))
     }
 }
@@ -21,7 +21,7 @@ struct TestStringConsumeFunc {}
 
 #[async_trait]
 impl TaskConsumerFunc<String, usize> for TestStringConsumeFunc {
-    async fn consumer(&self, params: Option<String>) -> MResult<usize> {
+    async fn consume(&self, params: Option<String>) -> MResult<usize> {
         Ok(params.map(|v| v.len()).unwrap_or(0))
     }
 }
@@ -30,7 +30,7 @@ struct TestConsumeFailFunc {}
 
 #[async_trait]
 impl TaskConsumerFunc<i32, i32> for TestConsumeFailFunc {
-    async fn consumer(&self, _params: Option<i32>) -> MResult<i32> {
+    async fn consume(&self, _params: Option<i32>) -> MResult<i32> {
         let x = Box::new("".to_string());
         Err(MSchedulerError::ExecutionError(x))
     }
@@ -40,7 +40,7 @@ struct TestConsumeWithTimeParamFunc {}
 
 #[async_trait]
 impl TaskConsumerFunc<u64, u64> for TestConsumeWithTimeParamFunc {
-    async fn consumer(&self, time: Option<u64>) -> MResult<u64> {
+    async fn consume(&self, time: Option<u64>) -> MResult<u64> {
         if let Some(wait_time) = time {
             tokio::time::sleep(Duration::from_secs(wait_time)).await;
         }

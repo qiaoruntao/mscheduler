@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,15 +22,15 @@ use tracing::{error, info, trace, warn};
 use typed_builder::TypedBuilder;
 
 use crate::tasker::error::{MResult, MSchedulerError};
-use crate::tasker::error::MSchedulerError::{ExecutionError, MongoDbError, NoTaskMatched, PanicError, TaskCancelled, UnknownError};
+use crate::tasker::error::MSchedulerError::{ConsumerShutdownError, ExecutionError, MongoDbError, NoTaskMatched, PanicError, TaskCancelled, UnknownError};
 use crate::tasker::task::Task;
 
 #[async_trait]
 pub trait TaskConsumerFunc<T: Send, K: Send>: Send + Sync + 'static {
-    async fn consumer(&self, params: Option<T>) -> MResult<K>;
+    async fn consume(&self, params: Option<T>) -> MResult<K>;
 }
 
-#[derive(Deserialize, TypedBuilder, Default)]
+#[derive(Deserialize, TypedBuilder, Debug)]
 #[builder(field_defaults(default, setter(into)))]
 #[non_exhaustive]
 pub struct TaskConsumerConfig {
@@ -37,8 +38,7 @@ pub struct TaskConsumerConfig {
     #[builder(default = 0)]
     pub worker_version: u32,
     // specific this worker's id, used to remote control worker behavior, also can be used to choose which task to run
-    #[builder(default_code = "hostname::get().unwrap_or_default().into_string().ok()", setter(strip_option))]
-    pub worker_id: Option<String>,
+    pub worker_id: String,
 }
 
 impl TaskConsumerConfig {
@@ -47,14 +47,7 @@ impl TaskConsumerConfig {
     }
 
     pub fn get_worker_id(&self) -> &str {
-        match &self.worker_id {
-            None => {
-                "default"
-            }
-            Some(v) => {
-                v.as_str()
-            }
-        }
+        self.worker_id.as_str()
     }
 }
 
@@ -69,22 +62,8 @@ impl<K: Send + 'static> TaskState<K> {
             let arc = arc.clone();
             let params = params.clone();
             async move {
-                let result = match tokio::spawn(async move { arc.consumer(params).await }).catch_unwind().await {
-                    Ok(Ok(v)) => { v }
-                    Ok(Err(e)) => {
-                        if e.is_panic() {
-                            Err(PanicError)
-                        } else if e.is_cancelled() {
-                            Err(TaskCancelled)
-                        } else {
-                            unreachable!();
-                        }
-                    }
-                    Err(_) => {
-                        error!("unexpected error found");
-                        Err(UnknownError)
-                    }
-                };
+                let result = Self::handle_consumer_logic(arc, params).await;
+                // let ping_logic = Self::handle_ping_logic(&key).await;
                 if let Err(e) = sender.send(PostHandling { key: key.as_str().to_string() }).await {
                     error!("failed to send task state update message {}",&e);
                 }
@@ -95,12 +74,38 @@ impl<K: Send + 'static> TaskState<K> {
             handler,
         }
     }
+
+    async fn handle_ping_logic(key: impl AsRef<str>) {
+        loop{
+
+        }
+    }
+
+    async fn handle_consumer_logic<T: Send + Clone + 'static, Func: TaskConsumerFunc<T, K>>(arc: Arc<Func>, params: Option<T>) -> MResult<K> {
+        match tokio::spawn(async move { arc.consume(params).await }).catch_unwind().await {
+            Ok(Ok(v)) => { v }
+            Ok(Err(e)) => {
+                if e.is_panic() {
+                    Err(PanicError)
+                } else if e.is_cancelled() {
+                    Err(TaskCancelled)
+                } else {
+                    unreachable!();
+                }
+            }
+            Err(_) => {
+                error!("unexpected error found");
+                Err(UnknownError)
+            }
+        }
+    }
 }
 
 pub struct SharedConsumerState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     collection: Collection<Task<T, K>>,
     func: Arc<Func>,
     config: TaskConsumerConfig,
+    max_tasks: AtomicU32,
     task_map: Mutex<HashMap<String, TaskState<K>>>,
 }
 
@@ -129,6 +134,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             collection,
             func: Arc::new(func),
             config,
+            max_tasks: AtomicU32::new(u32::MAX),
             task_map: Mutex::new(Default::default()),
         };
         let consumer = TaskConsumer {
@@ -165,6 +171,34 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let _ = tokio::join!(handle1, handle2, handle3, handle4);
     }
 
+    pub async fn shutdown(self: &Self) {
+        // disable accepting new tasks
+        self.set_max_worker_cnt(0);
+        // fail all existing tasks
+        let guard = self.state.task_map.lock().unwrap();
+        for key in guard.keys() {
+            match Self::mark_task_failed(self.state.clone(), key.as_str(), ConsumerShutdownError).await {
+                Ok(_) => {
+                    info!("shutdown task {} succeed", &key);
+                }
+                Err(e) => {
+                    error!("shutdown task {} failed", &e);
+                }
+            }
+        }
+    }
+
+    pub fn set_max_worker_cnt(self: &Self, max_cnt: u32) {
+        self.state.max_tasks.store(max_cnt, Ordering::SeqCst);
+    }
+
+    pub fn get_max_worker_cnt(self: &Self) -> u32 {
+        self.state.max_tasks.load(Ordering::SeqCst)
+    }
+
+    pub fn get_running_task_cnt(self: &Self) -> u32 {
+        self.state.task_map.lock().unwrap().len() as u32
+    }
 
     async fn start_listen2change_stream(state: Arc<SharedConsumerState<T, K, Func>>, next_doc_sender: Sender<NextDoc>) {
         loop {
@@ -199,6 +233,11 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             trace!("start_process_loop");
             tokio::select! {
                 Some(expired)=futures::future::poll_fn(|cx| queue.poll_expired(cx))=>{
+                    let max_task_cnt=state.max_tasks.load(Ordering::SeqCst);
+                    // TODO: 一旦错过任务需要通过主动查询的方式重新获取任务
+                    if max_task_cnt <= state.task_map.lock().unwrap().len() as u32 {
+                        continue;
+                    }
                     Self::try_occupy_task(state.clone(), expired, post_handling_sender.clone()).await;
                     if queue.is_empty(){
                         trace!("queue empty, check remaining tasks");
@@ -261,7 +300,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             if !task_state.handler.is_finished() {
                 warn!("task is not finished before post running, key={}",&key);
             }
-            let handle_result = match task_state.handler.await.unwrap() {
+            let _handle_result = match task_state.handler.await.unwrap() {
                 Ok(returns) => {
                     Self::mark_task_success(state.clone(), &key, returns).await
                 }
@@ -375,6 +414,10 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 // ignore normal errors
             }
         }
+    }
+
+    async fn ping_task(key: impl AsRef<str>) -> MResult<()> {
+        Ok(())
     }
 
     async fn occupy_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>) -> MResult<Task<T, K>> {

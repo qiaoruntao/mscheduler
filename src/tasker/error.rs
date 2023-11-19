@@ -14,6 +14,8 @@ pub enum MSchedulerError {
     UnknownError,
     // panic during task execution
     PanicError,
+    // shutting down
+    ConsumerShutdownError,
     // panic during task execution
     TaskCancelled,
     // task execution logic send back some error
