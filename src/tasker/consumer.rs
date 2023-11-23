@@ -132,18 +132,18 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     }
 
     pub async fn start(self: &Self) {
-        TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone()).await;
-        // select! {
-        //     _=TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone())=>{
-        //         warn!("listen_db loop exits");
-        //     }
-        //     _=TaskConsumer::<T, K, Func>::spawn_fetch_db(self.state.clone())=>{
-        //         warn!("fetch_db loop exits");
-        //     }
-        //     _=TaskConsumer::<T, K, Func>::spawn_occupy(self.state.clone())=>{
-        //         warn!("occupy loop exits");
-        //     }
-        // }
+        // TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone()).await;
+        select! {
+            _=TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone())=>{
+                warn!("listen_db loop exits");
+            }
+            _=TaskConsumer::<T, K, Func>::spawn_fetch_db(self.state.clone())=>{
+                warn!("fetch_db loop exits");
+            }
+            _=TaskConsumer::<T, K, Func>::spawn_occupy(self.state.clone())=>{
+                warn!("occupy loop exits");
+            }
+        }
     }
 
     async fn spawn_occupy(state: Arc<SharedConsumerState<T, K, Func>>) {
@@ -224,15 +224,15 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     "operationType":1_i32,
                     // mongodb-rust says ns field should not get filtered
                     "ns":1_i32,
-                    // "fullDocument":1_i32,
-                    "fullDocument.key":"$fullDocument.key",
-                    "fullDocument.next_occupy_time":{"$max":["$fullDocument.task_state.start_time", {"$max":"$fullDocument.task_state.worker_states.ping_expire_time"}]},
+                    "fullDocument":1_i32,
+                    // "fullDocument.key":"$fullDocument.key",
+                    // "fullDocument.next_occupy_time":{"$max":["$fullDocument.task_state.start_time", {"$max":"$fullDocument.task_state.worker_states.ping_expire_time"}]},
                 }
             }
         ];
         println!("{}", pipeline[0]);
         println!("{}", pipeline[1]);
-        let mut change_stream = match state.collection.clone_with_type::<Document>().watch([], None).await {
+        let mut change_stream = match state.collection.clone_with_type::<Task<T, K>>().watch(pipeline, Some(change_stream_options)).await {
             Ok(v) => { v }
             Err(e) => {
                 error!("failed to open change stream {}",e);
@@ -264,32 +264,32 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     v
                 }
             };
-            info!("doc = {:?}", task);
-            // let consumer_event = match TaskConsumer::<T, K, Func>::infer_consumer_event_from_task(task) {
-            //     None => {
-            //         // this is normal
-            //         continue;
-            //     }
-            //     Some(v) => { v }
-            // };
-            // if let Err(e) = event_sender.send(consumer_event).await {
-            //     error!("failed to send consumer event {}",e);
-            // }
+            info!("key ={}",&task.key);
+            let consumer_event = match TaskConsumer::<T, K, Func>::infer_consumer_event_from_task(task) {
+                None => {
+                    // this is normal
+                    continue;
+                }
+                Some(v) => { v }
+            };
+            if let Err(e) = event_sender.send(consumer_event).await {
+                error!("failed to send consumer event {}",e);
+            }
         }
         error!("change stream exited");
         Ok(())
     }
 
-    fn infer_consumer_event_from_task(task: NextDoc) -> Option<ConsumerEvent> {
-        // let mut max_time = task.task_state.create_time;
-        // for state in task.task_state.worker_states {
-        //     if let Some(t) = state.ping_expire_time {
-        //         max_time = max_time.max(t);
-        //     }
-        // }
+    fn infer_consumer_event_from_task(task: Task<T, K>) -> Option<ConsumerEvent> {
+        let mut max_time = task.task_state.create_time;
+        for state in task.task_state.worker_states {
+            if let Some(t) = state.ping_expire_time {
+                max_time = max_time.max(t);
+            }
+        }
         let event = ConsumerEvent::WaitOccupy {
             key: task.key,
-            next_occupy_time: task.next_occupy_time,
+            next_occupy_time: max_time,
         };
         Some(event)
     }
