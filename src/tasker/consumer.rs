@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use kanal::{AsyncReceiver, AsyncSender, bounded_async};
-use mongodb::bson::{DateTime, doc, Document};
+use mongodb::bson::{DateTime, doc};
 use mongodb::Collection;
 use mongodb::options::{ChangeStreamOptions, FullDocumentType};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use tokio::select;
+use tokio::sync::broadcast::{Receiver, Sender};
 use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
 use tracing::{error, info, trace, warn};
@@ -54,8 +54,8 @@ pub struct SharedConsumerState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     is_fully_scanned: AtomicBool,
     config: TaskConsumerConfig,
     max_allowed_task_cnt: AtomicU32,
-    consumer_event_sender: AsyncSender<ConsumerEvent>,
-    consumer_event_receiver: AsyncReceiver<ConsumerEvent>,
+    consumer_event_sender: Sender<ConsumerEvent>,
+    consumer_event_receiver: Receiver<ConsumerEvent>,
 }
 
 pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
@@ -84,7 +84,7 @@ struct PostHandling {
 }
 
 /// used to notify both inner and outer receivers
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub enum ConsumerEvent {
     WaitOccupy {
         key: String,
@@ -98,12 +98,13 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         0
     }
 
-    pub fn get_event_receiver(&self) -> AsyncReceiver<ConsumerEvent> {
-        self.state.consumer_event_receiver.clone()
+    pub fn get_event_receiver(&self) -> Receiver<ConsumerEvent> {
+        self.state.consumer_event_sender.subscribe()
     }
 
     pub async fn create(collection: Collection<Task<T, K>>, func: Func, config: TaskConsumerConfig) -> MResult<Self> {
-        let (sender, receiver) = bounded_async::<ConsumerEvent>(0);
+        // TODO: magic number
+        let (sender, receiver) = tokio::sync::broadcast::channel::<ConsumerEvent>(10);
         let shared_consumer_state = SharedConsumerState {
             collection,
             func: Arc::new(func),
@@ -132,23 +133,23 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     }
 
     pub async fn start(self: &Self) {
-        TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone()).await;
-        // select! {
-        //     _=TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone())=>{
-        //         warn!("listen_db loop exits");
-        //     }
-        //     _=TaskConsumer::<T, K, Func>::spawn_fetch_db(self.state.clone())=>{
-        //         warn!("fetch_db loop exits");
-        //     }
-        //     _=TaskConsumer::<T, K, Func>::spawn_occupy(self.state.clone())=>{
-        //         warn!("occupy loop exits");
-        //     }
-        // }
+        // TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone()).await;
+        select! {
+            _=TaskConsumer::<T, K, Func>::spawn_listen_db(self.state.clone())=>{
+                warn!("listen_db loop exits");
+            }
+            _=TaskConsumer::<T, K, Func>::spawn_fetch_db(self.state.clone())=>{
+                warn!("fetch_db loop exits");
+            }
+            _=TaskConsumer::<T, K, Func>::spawn_occupy(self.state.clone())=>{
+                warn!("occupy loop exits");
+            }
+        }
     }
 
     async fn spawn_occupy(state: Arc<SharedConsumerState<T, K, Func>>) {
         trace!("spawn_occupy");
-        let receiver = state.consumer_event_receiver.clone();
+        let mut receiver = state.consumer_event_sender.subscribe();
         let sender = state.consumer_event_sender.clone();
         let mut queue = DelayQueue::<String>::new();
         loop {
@@ -165,7 +166,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 }
                 Some(expired)=futures::future::poll_fn(|cx| queue.poll_expired(cx))=>{
                     if queue.is_empty(){
-                        if let Err(e)=sender.send(WaitOccupyQueueEmpty).await{
+                        if let Err(e)=sender.send(WaitOccupyQueueEmpty){
                             error!("failed to send occupy queue empty event {}",e);
                         }
                     }
@@ -185,7 +186,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     async fn spawn_fetch_db(state: Arc<SharedConsumerState<T, K, Func>>) -> MResult<()> {
         trace!("spawn_fetch_db");
-        let receiver = state.consumer_event_receiver.clone();
+        let mut receiver = state.consumer_event_sender.subscribe();
         while let Ok(consumer_event) = receiver.recv().await {
             match consumer_event {
                 WaitOccupyQueueEmpty => {
@@ -224,15 +225,15 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     "operationType":1_i32,
                     // mongodb-rust says ns field should not get filtered
                     "ns":1_i32,
-                    // "fullDocument":1_i32,
-                    "fullDocument.key":"$fullDocument.key",
-                    "fullDocument.next_occupy_time":{"$max":["$fullDocument.task_state.start_time", {"$max":"$fullDocument.task_state.worker_states.ping_expire_time"}]},
+                    "fullDocument":1_i32,
+                    // "fullDocument.key":"$fullDocument.key",
+                    // "fullDocument.next_occupy_time":{"$max":["$fullDocument.task_state.start_time", {"$max":"$fullDocument.task_state.worker_states.ping_expire_time"}]},
                 }
             }
         ];
         println!("{}", pipeline[0]);
         println!("{}", pipeline[1]);
-        let mut change_stream = match state.collection.clone_with_type::<Document>().watch([], None).await {
+        let mut change_stream = match state.collection.clone_with_type::<Task<T, K>>().watch(pipeline, Some(change_stream_options)).await {
             Ok(v) => { v }
             Err(e) => {
                 error!("failed to open change stream {}",e);
@@ -264,32 +265,32 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     v
                 }
             };
-            info!("doc = {:?}", task);
-            // let consumer_event = match TaskConsumer::<T, K, Func>::infer_consumer_event_from_task(task) {
-            //     None => {
-            //         // this is normal
-            //         continue;
-            //     }
-            //     Some(v) => { v }
-            // };
-            // if let Err(e) = event_sender.send(consumer_event).await {
-            //     error!("failed to send consumer event {}",e);
-            // }
+            info!("key ={}",&task.key);
+            let consumer_event = match TaskConsumer::<T, K, Func>::infer_consumer_event_from_task(task) {
+                None => {
+                    // this is normal
+                    continue;
+                }
+                Some(v) => { v }
+            };
+            if let Err(e) = event_sender.send(consumer_event) {
+                error!("failed to send consumer event {}",e);
+            }
         }
         error!("change stream exited");
         Ok(())
     }
 
-    fn infer_consumer_event_from_task(task: NextDoc) -> Option<ConsumerEvent> {
-        // let mut max_time = task.task_state.create_time;
-        // for state in task.task_state.worker_states {
-        //     if let Some(t) = state.ping_expire_time {
-        //         max_time = max_time.max(t);
-        //     }
-        // }
+    fn infer_consumer_event_from_task(task: Task<T, K>) -> Option<ConsumerEvent> {
+        let mut max_time = task.task_state.create_time;
+        for state in task.task_state.worker_states {
+            if let Some(t) = state.ping_expire_time {
+                max_time = max_time.max(t);
+            }
+        }
         let event = ConsumerEvent::WaitOccupy {
             key: task.key,
-            next_occupy_time: task.next_occupy_time,
+            next_occupy_time: max_time,
         };
         Some(event)
     }
