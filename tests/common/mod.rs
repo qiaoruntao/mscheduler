@@ -1,8 +1,10 @@
 use std::env;
+use kanal::AsyncReceiver;
 
 use mongodb::{Client, Collection};
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ResolverConfig};
+use mscheduler::tasker::consumer::ConsumerEvent;
 use mscheduler::tasker::task_common::ensure_index;
 
 pub async fn get_collection_for_test<T>(collection_name: impl AsRef<str>) -> Collection<T> {
