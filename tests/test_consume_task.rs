@@ -261,7 +261,7 @@ mod test {
         let collection = get_collection_for_test("test_ping_task").await;
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         // init collection with some tasks
-        let send_task_option = SendTaskOption::builder().ping_interval_ms(1000_u32).build();
+        let send_task_option = SendTaskOption::builder().ping_interval_ms(1000_u32).worker_timeout_ms(2500_u32).build();
         task_producer.send_task("111", -5, Some(send_task_option)).await.expect("failed to send task");
         let worker_id01 = "aaa";
         // start the consumer
@@ -287,11 +287,11 @@ mod test {
         let task_time02 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").expect("failed to get task");
         let second_ping_expire_time = task_time02.task_state.worker_states.get(0).unwrap().ping_expire_time;
         assert_ne!(first_ping_expire_time, second_ping_expire_time, "ping expire time not updated");
-        assert_eq!(task_consumer1.get_running_task_cnt(), 1);
-        assert_eq!(task_consumer2.get_running_task_cnt(), 0);
+        assert_eq!(task_consumer1.get_running_task_cnt(), 1, "consumer 1 task should still be running");
+        assert_eq!(task_consumer2.get_running_task_cnt(), 0, "consumer 2 should not occupy task before it finishes");
         // wait for the task to fail and consumer2 should handle it
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(task_consumer1.get_running_task_cnt(), 0);
-        assert_eq!(task_consumer2.get_running_task_cnt(), 1);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(task_consumer1.get_running_task_cnt(), 0, "no task should be running in consumer 1");
+        assert_eq!(task_consumer2.get_running_task_cnt(), 1, "one task should be running in consumer 2");
     }
 }

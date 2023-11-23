@@ -38,6 +38,8 @@ pub struct SendTaskOption {
     // clean up existing task's failed worker states
     // pub clean_failed: bool,
     // TODO: more options in task_option
+    #[builder(default = 60_000)]
+    worker_timeout_ms: u32,
 }
 
 pub struct SendTaskResult {
@@ -76,8 +78,8 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
         let task_option = TaskOption {
             priority: 0,
             concurrent_worker_cnt: send_option.concurrency_cnt,
-            ping_interval_ms: send_option.ping_interval_ms as u32,
-            worker_timeout_ms: 60_000,
+            ping_interval_ms: send_option.ping_interval_ms,
+            worker_timeout_ms: send_option.worker_timeout_ms,
             min_worker_version: send_option.min_worker_version,
             specific_worker_ids: vec![],
             max_unexpected_retries: 3,

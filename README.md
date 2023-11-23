@@ -29,6 +29,10 @@ Task
 2. TaskOption
 3. \<T\>参数
 
+TaskConsumer
+1. Arc\<Func\> 因为需要spawn到其他线程内执行
+2. 
+
 任务中worker state的状态转换
 1. INIT 刚发送
 2. RUNNING 被worker占领并执行中

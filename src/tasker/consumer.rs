@@ -23,7 +23,7 @@ use typed_builder::TypedBuilder;
 
 use crate::tasker::error::{MResult, MSchedulerError};
 use crate::tasker::error::MSchedulerError::{ConsumerShutdownError, ExecutionError, MongoDbError, NoTaskMatched, PanicError, TaskCancelled, UnknownError};
-use crate::tasker::task::Task;
+use crate::tasker::task::{Task, TaskOption};
 
 #[async_trait]
 pub trait TaskConsumerFunc<T: Send, K: Send>: Send + Sync + 'static {
@@ -61,7 +61,7 @@ impl<K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static> TaskState<
         let handler = tokio::spawn({
             let arc = state.func.clone();
             let params = task.params.clone();
-            let ping_handler = tokio::spawn(Self::handle_ping_logic(state.clone(), task.key.clone(), task.task_option.ping_interval_ms));
+            let ping_handler = tokio::spawn(Self::handle_ping_logic(state.clone(), task.key.clone(), task.task_option));
             // TODO: consumer logic 需要在ping logic之前结束, 否则报错
             async move {
                 let result = Self::handle_consumer_logic(arc, params).await;
@@ -81,11 +81,11 @@ impl<K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static> TaskState<
         }
     }
 
-    async fn handle_ping_logic<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, Func: TaskConsumerFunc<T, K> + Send>(state: Arc<SharedConsumerState<T, K, Func>>, key: String, ping_interval_ms: u32) {
-        trace!("start to handle_ping_logic key={}, ping_interval_ms={}", &key, &ping_interval_ms);
+    async fn handle_ping_logic<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, Func: TaskConsumerFunc<T, K> + Send>(state: Arc<SharedConsumerState<T, K, Func>>, key: String, task_option: TaskOption) {
+        trace!("start to handle_ping_logic key={}, ping_interval_ms={}", &key, &task_option.ping_interval_ms);
         loop {
-            tokio::time::sleep(Duration::from_millis(ping_interval_ms as u64)).await;
-            match TaskConsumer::ping_task(state.clone(), key.as_str()).await {
+            tokio::time::sleep(Duration::from_millis(task_option.ping_interval_ms as u64)).await;
+            match TaskConsumer::ping_task(state.clone(), key.as_str(), task_option.worker_timeout_ms).await {
                 Ok(_) => {}
                 Err(e) => {
                     error!("failed to update ping time for task key={} error={}", key.as_str(), &e);
@@ -140,7 +140,7 @@ impl<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> Clone for TaskConsumer<T, K
 #[derive(Deserialize, Debug)]
 struct NextDoc {
     pub key: String,
-    pub start_time: DateTime,
+    pub next_occupy_time: DateTime,
 }
 
 #[derive(Deserialize)]
@@ -281,7 +281,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 }
                 Some(doc)=next_doc_receiver.recv()=>{
                     trace!("handling new doc");
-                    let diff = doc.start_time.timestamp_millis() - DateTime::now().timestamp_millis();
+                    let diff = doc.next_occupy_time.timestamp_millis() - DateTime::now().timestamp_millis();
                     let duration=if diff>0{
                         Duration::from_millis(diff.min(1_000_000) as u64)
                     }else{
@@ -316,7 +316,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         for _ in 0..10 {
             if let Some(Ok(task)) = cursor.next().await {
                 let task = from_document::<Task<T, K>>(task).unwrap();
-                let next_doc = NextDoc { key: task.key, start_time: task.task_state.start_time };
+                let next_doc = NextDoc { key: task.key, next_occupy_time: task.task_state.start_time };
                 if let Err(e) = next_doc_sender.send(next_doc).await {
                     error!(worker_id=state.config.worker_id, "failed to send next doc {}",e);
                 }
@@ -460,16 +460,17 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     }
 
     #[instrument(skip_all, fields(key = key.as_ref()))]
-    async fn ping_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>) -> MResult<()> {
+    async fn ping_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, worker_timeout_ms: u32) -> MResult<()> {
         trace!("start to ping task {}", key.as_ref());
         // check if already occupied
         let filter = doc! {
             "key":key.as_ref(),
             "task_state.worker_states.worker_id":&state.config.worker_id,
         };
+        let expire_time = DateTime::from_millis(DateTime::now().timestamp_millis() + (worker_timeout_ms as i64));
         let update = doc! {
-            "$currentDate":{
-                "task_state.worker_states.$.ping_expire_time":true,
+            "$set":{
+                "task_state.worker_states.$.ping_expire_time":expire_time,
             }
         };
         match state.collection.find_one_and_update(
@@ -521,32 +522,42 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                             }
                         }]
                     },
+                    // TODO: temp fix
+
                     // check worker count
                     {
                         "$or": [
                             { "task_state.worker_states": { "$size": 0 } },
+                        {
+                            "$and":[                    {"task_state.worker_states.success_time":{"$exists":false}},
+                    {"task_state.worker_states.ping_expire_time":{"$lt":DateTime::now()}}
+                        ]
+                        },
                             // optimize for only one worker condition
-                            {
-                                "$expr": {
-                                    "$lt": [{
-                                        "$size": {
-                                            "$filter": {
-                                                "input": "$task_state.worker_states",
-                                                "as": "item",
-                                                "cond": {"$or":[
-                                                  { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
-                                                  { "$ne": ["$$item.success_time", Bson::Null] },
-                                                  { "$ne": ["$$item.fail_time", Bson::Null] },
-                                                ]}
-                                            }
-                                        }
-                                    }, "$task_option.concurrent_worker_cnt"]
-                                }
-                            },
+                            // {
+                            //     "$expr": {
+                            //         "$lt": [{
+                            //             "$size": {
+                            //                 "$filter": {
+                            //                     "input": "$task_state.worker_states",
+                            //                     "as": "item",
+                            //                     "cond": {"$or":[
+                            //                       { "$gt": ["$$item.ping_expire_time", DateTime::now()] },
+                            //                       { "$ne": ["$$item.success_time", Bson::Null] },
+                            //                       // { "$ne": ["$$item.fail_time", Bson::Null] },
+                            //                     ]}
+                            //                 }
+                            //             }
+                            //         }, "$task_option.concurrent_worker_cnt"]
+                            //     }
+                            // },
                         ]
                     }
                 ]
             };
+        // println!("{}", serde_json::to_string(&filter).unwrap());
+        let expire_time = DateTime::from_millis(DateTime::now().timestamp_millis() + (10_000i64));
+
         let update = vec![doc! {
             "$set": {
                 "task_state.worker_states": {
@@ -562,7 +573,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                         }
                     }, [{
                         "worker_id": worker_id,
-                        "ping_expire_time": "$$NOW",
+                        "ping_expire_time": expire_time,
                     }]]
                 }
             }
@@ -603,10 +614,12 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     // mongodb-rust says ns field should not get filtered
                     "ns":1_i32,
                     "fullDocument.key":"$fullDocument.key",
-                    "fullDocument.start_time":"$fullDocument.task_state.start_time",
+                    "fullDocument.next_occupy_time":{"$max":["$fullDocument.task_state.start_time", {"$max":"$fullDocument.task_state.worker_states.ping_expire_time"}]},
                 }
             }
         ];
+        // let result = serde_json::to_string(&pipeline);
+        // println!("{}", result.unwrap());
         let mut change_stream_options = ChangeStreamOptions::default();
         change_stream_options.full_document = Some(FullDocumentType::UpdateLookup);
         match collection.clone_with_type::<NextDoc>().watch(pipeline, Some(change_stream_options)).await {
@@ -625,65 +638,70 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             let mut temp = vec![
                 // success
                 doc! { "$ne": ["$$item.success_time", Bson::Null] },
-                // fail
-                doc! { "$ne": ["$$item.fail_time", Bson::Null] },
+                // fail TODO： temporary disable due to unable occupy task
+                // doc! { "$ne": ["$$item.fail_time", Bson::Null] },
             ];
             if check_ping_time {
                 // running
                 temp.push(
                     doc! {
                         "$and":[
-                        { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
-                        { "$eq": ["$$item.success_time", Bson::Null] },
-                        { "$eq": ["$$item.fail_time", Bson::Null] },
+                            { "$gt": ["$$item.ping_expire_time", "$$NOW"] },
+                            { "$eq": ["$$item.success_time", Bson::Null] },
+                            { "$eq": ["$$item.fail_time", Bson::Null] },
                         ]
                     }
                 );
             }
             temp
         };
+        let mut and_conditions = vec![
+            doc! {"task_state.worker_states":{"$exists":true}},
+            doc! {
+                "$or":[
+                    { "task_option.min_worker_version": { "$exists": false } },
+                    { "task_option.min_worker_version": { "$lte": &config.worker_version } },
+                ]
+            },
+            // not already occupied
+            doc! {
+                "task_state.worker_states.worker_id":{"$ne":config.get_worker_id()}
+            },
+            // has worker space remains
+            // doc! {
+            //     "$or":[
+            //         { "task_state.worker_states": { "$size": 0 } },
+            //         {
+            //             "$expr": {
+            //                 // running worker cnt+finished worker cnt<concurrent_worker_cnt
+            //                 "$lt": [{
+            //                     "$size": {
+            //                         "$filter": {
+            //                             "input": "$task_state.worker_states",
+            //                             "as": "item",
+            //                             "cond": {"$or":task_state_filters}
+            //                         }
+            //                     }
+            //                 }, "$task_option.concurrent_worker_cnt"]
+            //             }
+            //         },
+            //     ]
+            // },
+        ];
+        and_conditions.push(doc! {
+                "$or":[
+                    { "task_option.specific_worker_ids": { "$exists": false } },
+                    { "task_option.specific_worker_ids": { "$size": 0 } },
+                    { "task_option.specific_worker_ids": config.get_worker_id() },
+                ]
+            });
+        // if check_ping_time {
+        //     // TODO: temporary block this for change stream
+        //
+        // }
         doc! {
             "$match":{
-                "$and":[
-                     {"task_state.worker_states":{"$exists":true}},
-                     {
-                        "$or":[
-                            { "task_option.min_worker_version": { "$exists": false } },
-                            { "task_option.min_worker_version": { "$lte": &config.worker_version } },
-                        ]
-                    },
-                     {
-                        "$or":[
-                            { "task_option.specific_worker_ids": { "$exists": false } },
-                            { "task_option.specific_worker_ids": { "$size": 0 } },
-                            { "task_option.specific_worker_ids": config.get_worker_id() },
-                        ]
-                    },
-                    // not already occupied
-                    {
-                        "task_state.worker_states.worker_id":{"$ne":config.get_worker_id()}
-                    },
-                    // has worker space remains
-                     {
-                        "$or":[
-                            { "task_state.worker_states": { "$size": 0 } },
-                            {
-                                "$expr": {
-                                // running worker cnt+finished worker cnt<concurrent_worker_cnt
-                                    "$lt": [{
-                                        "$size": {
-                                            "$filter": {
-                                                "input": "$task_state.worker_states",
-                                                "as": "item",
-                                                "cond": {"$or":task_state_filters}
-                                            }
-                                        }
-                                    }, "$task_option.concurrent_worker_cnt"]
-                                }
-                            },
-                        ]
-                    },
-                ]
+                "$and":and_conditions
             }
         }
     }
