@@ -14,7 +14,7 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task::Task;
 
-    use crate::common::get_collection_for_test;
+    use crate::common::{get_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
 
     struct TestConsumeFunc {}
 
@@ -32,37 +32,28 @@ mod test {
         // consumer
         let worker_id1 = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
-        tokio::spawn({
-            let task_consumer = task_consumer.clone();
-            async move { task_consumer.start().await }
-        });
-        // listen to event
-        let mut receiver = task_consumer.get_event_receiver();
-
+        spawn_running_consumer_handler(task_consumer.clone());
         // test: wait for occupy event
-        let wait4occupy_event_handler = tokio::spawn(async move {
-            while let Ok(event) = receiver.recv().await {
-                match event {
-                    ConsumerEvent::WaitOccupy { key, .. } => {
-                        info!("received key={}", &key);
-                        return key == "111";
-                    }
-                    _ => {}
+        let wait4occupy_event_handler = spawn_check_handler(task_consumer.clone(), |event| {
+            match event {
+                ConsumerEvent::WaitOccupy { key, .. } => {
+                    info!("received key={}", &key);
+                    key == "111"
+                }
+                _ => {
+                    false
                 }
             }
-            false
-        });
+        }, Duration::from_secs(5));
         // producer
         let task_producer = TaskProducer::create(collection2).expect("failed to create producer");
 
-
         // send task
-        let mut send_task_option = SendTaskOption::default();
-        send_task_option.concurrency_cnt = 2;
+        let send_task_option = SendTaskOption::builder()
+            .concurrency_cnt(2_u32)
+            .build();
         task_producer.send_task("111", 1, Some(send_task_option)).await.expect("failed to send task");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        wait4occupy_event_handler.await;
         // check if ok
-        // assert!(wait4occupy_event_handler.is_finished());
+        assert!(wait4occupy_event_handler.await.expect("failed to wait 4 event").is_some());
     }
 }

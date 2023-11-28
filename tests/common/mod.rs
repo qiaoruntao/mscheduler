@@ -1,12 +1,17 @@
 use std::env;
-use kanal::AsyncReceiver;
+use std::time::Duration;
 
 use mongodb::{Client, Collection};
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ResolverConfig};
-use mscheduler::tasker::consumer::ConsumerEvent;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use tokio::task::JoinHandle;
+
+use mscheduler::tasker::consumer::{ConsumerEvent, TaskConsumer, TaskConsumerFunc};
 use mscheduler::tasker::task_common::ensure_index;
 
+/// important: clone a collection will not duplicate change stream events
 pub async fn get_collection_for_test<T>(collection_name: impl AsRef<str>) -> Collection<T> {
     let connection_str = env::var("MongoStr").expect("need mongodb connection str");
     let client_options = if cfg!(windows) && connection_str.contains("+srv") {
@@ -22,4 +27,22 @@ pub async fn get_collection_for_test<T>(collection_name: impl AsRef<str>) -> Col
     collection.delete_many(doc! {}, None).await.expect("failed to clean up collection");
     ensure_index(&collection).await;
     collection
+}
+
+pub fn spawn_check_handler<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send, F: Fn(&ConsumerEvent) -> bool + Send + 'static>(task_consumer: TaskConsumer<T, K, Func>, check: F, duration: Duration) -> JoinHandle<Option<ConsumerEvent>> {
+    tokio::spawn({
+        async move {
+            task_consumer.wait_for_event_with_timeout(check, duration).await
+        }
+    })
+}
+
+pub fn spawn_running_consumer_handler<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize + DeserializeOwned + Send + Unpin + Sync + 'static, Func: TaskConsumerFunc<T, K> + Send>(task_consumer: TaskConsumer<T, K, Func>) -> JoinHandle<()> {
+    tokio::spawn({
+        let task_consumer = task_consumer.clone();
+        async move {
+            task_consumer.start().await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
 }

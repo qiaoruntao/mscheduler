@@ -5,7 +5,6 @@ use tracing::info;
 
 use mscheduler::tasker::consumer::TaskConsumerFunc;
 use mscheduler::tasker::error::MResult;
-use mscheduler::tasker::error::MSchedulerError;
 use mscheduler::tasker::error::MSchedulerError::ExecutionError;
 
 mod common;
@@ -34,7 +33,7 @@ struct TestConsumeFailFunc {}
 impl TaskConsumerFunc<i32, i32> for TestConsumeFailFunc {
     async fn consume(&self, _params: Option<i32>) -> MResult<i32> {
         let x = Box::new("".to_string());
-        Err(MSchedulerError::ExecutionError(x))
+        Err(ExecutionError(x))
     }
 }
 
@@ -134,7 +133,7 @@ mod test {
         tokio::spawn(async move { task_consumer.start().await });
         tokio::spawn(async move { task_consumer2.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
-        let mut send_task_option = SendTaskOption::default();
+        let mut send_task_option = SendTaskOption::builder().build();
         send_task_option.concurrency_cnt = 2;
         task_producer.send_task("111", 1, Some(send_task_option)).await.expect("failed to send task");
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -155,7 +154,7 @@ mod test {
         tokio::spawn(async move { task_consumer.start().await });
         tokio::spawn(async move { task_consumer2.start().await });
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
-        let mut send_task_option = SendTaskOption::default();
+        let mut send_task_option = SendTaskOption::builder().build();
         send_task_option.concurrency_cnt = 2;
         task_producer.send_task("111", 1, Some(send_task_option)).await.expect("failed to send task");
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -179,7 +178,7 @@ mod test {
         tokio::spawn(async move { task_consumer.start().await });
 
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
-        let mut send_task_option = SendTaskOption::default();
+        let mut send_task_option = SendTaskOption::builder().build();
         send_task_option.concurrency_cnt = 1;
         send_task_option.min_worker_version = 1;
         task_producer.send_task("111", 1, Some(send_task_option)).await.expect("failed to send task");
