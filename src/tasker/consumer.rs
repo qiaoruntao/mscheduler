@@ -263,7 +263,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         };
         let update = doc! {
             "$set":{
-                "task_state.worker_states.$.success_time":"$$NOW",
+                "task_state.worker_states.$.success_time":DateTime::now(),
             }
         };
         let task = match state.collection.find_one_and_update(filter, update, None).await {
@@ -289,16 +289,21 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         // however we loose the restriction to not fail or success
         let filter = doc! {
             "key": key.as_ref(),
-            "task_state.worker_states.worker_id": &state.config.worker_id,
-            "task_state.worker_states.running_id": &running_id,
-            "task_state.worker_states.fail_time": {"$exists":false},
-            "task_state.worker_states.success_time": {"$exists":false}
+            "task_state.worker_states":{
+                "$elemMatch": {
+                    "running_id": &running_id,
+                    "worker_id": &state.config.worker_id,
+                    "fail_time": {"$exists": false},
+                    "success_time": {"$exists": false}
+                }
+            }
         };
         let update = doc! {
             "$set":{
-                "task_state.worker_states.$.fail_time":"$$NOW",
+                "task_state.worker_states.$.fail_time":DateTime::now(),
             }
         };
+        trace!("{}", &filter);
         let task = match state.collection.find_one_and_update(filter, update, None).await {
             Ok(Some(v)) => {
                 trace!("mark as failed succeed key={}",key.as_ref());
@@ -309,7 +314,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 return Err(NoTaskMatched);
             }
             Err(e) => {
-                error!("failed to mark task as failed, cannot find that task");
+                error!("failed to mark task as failed, {}",&e);
                 return Err(MSchedulerError::MongoDbError(Arc::from(e)));
             }
         };
@@ -369,8 +374,21 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                                 "input": "$task_state.worker_states",
                                 "as": "item",
                                 "cond": {"$or":[
-                                  { "$gt": ["$$item.ping_expire_time", DateTime::now()] },
-                                  { "$ne": ["$$item.success_time", Bson::Null] },
+                                    // running
+                                    {
+                                        "$and":[
+                                            { "$gt": ["$$item.ping_expire_time", DateTime::now()] },
+                                            { "$eq": ["$$item.success_time", Bson::Null] },
+                                            { "$eq": ["$$item.fail_time", Bson::Null] },
+                                        ]
+                                    },
+                                    // success
+                                    {
+                                        "$and":[
+                                            { "$ne": ["$$item.success_time", Bson::Null] },
+                                            { "$eq": ["$$item.fail_time", Bson::Null] },
+                                        ]
+                                    }
                                 ]}
                             }
                         }
@@ -406,6 +424,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             }
         ];
         let filter = doc! {"$and":all_conditions};
+        trace!("updating {}", filter);
         match state.collection.find_one_and_update(filter, update, None).await {
             Ok(Some(v)) => {
                 trace!("successfully occupy task key={}", &task_key);

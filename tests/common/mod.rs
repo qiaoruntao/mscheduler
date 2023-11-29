@@ -42,7 +42,7 @@ pub fn spawn_running_consumer_handler<T: DeserializeOwned + Send + Unpin + Sync 
         let task_consumer = task_consumer.clone();
         async move {
             task_consumer.start().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     })
 }

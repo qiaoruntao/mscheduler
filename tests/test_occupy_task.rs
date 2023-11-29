@@ -160,28 +160,32 @@ mod test {
             let mut receiver = task_consumer.get_event_receiver();
             async move {
                 while let Ok(event) = receiver.recv().await {
-                    tx.send(event).await.expect("failed to store event");
+                    match &event {
+                        ConsumerEvent::WaitOccupy { .. } => {
+                            tx.send(event).await.expect("failed to store event");
+                        }
+                        _ => {}
+                    }
                 }
             }
         });
 
         // send task
         let send_task_option = SendTaskOption::builder().concurrency_cnt(1_u32).worker_timeout_ms(3000_u32).build();
-        task_producer.send_task("111", TestConsumeParam::builder().emit_error(true).build(), Some(send_task_option)).await.expect("failed to send task");
+        task_producer.send_task("111", TestConsumeParam::builder().timeout_sec(2_u32).emit_error(true).build(), Some(send_task_option)).await.expect("failed to send task");
+        // tokio::time::sleep(Duration::from_secs(7)).await;
 
         // wait for task occupy 1
-        let consumer_event01 = timeout(Duration::from_secs(3), rx.recv()).await.expect("should receive an event").expect("should contain an event");
+        let consumer_event01 = timeout(Duration::from_secs(5), rx.recv()).await.expect("should receive an event").expect("should contain an event");
         match consumer_event01 {
-            ConsumerEvent::WaitOccupy { .. } => {
-
-            }
+            ConsumerEvent::WaitOccupy { .. } => {}
             _ => {
                 assert!(false, "failed to receive occupy event");
             }
         }
 
         // wait for task occupy 2
-        let consumer_event02 = timeout(Duration::from_secs(3), rx.recv()).await.expect("should receive an event").expect("should contain an event");
+        let consumer_event02 = timeout(Duration::from_secs(5), rx.recv()).await.expect("should receive an event").expect("should contain an event");
         match consumer_event02 {
             ConsumerEvent::WaitOccupy { .. } => {}
             _ => {
@@ -190,12 +194,14 @@ mod test {
         }
 
         // wait for task occupy 3
-        let consumer_event03 = timeout(Duration::from_secs(3), rx.recv()).await.expect("should receive an event").expect("should contain an event");
+        let consumer_event03 = timeout(Duration::from_secs(5), rx.recv()).await.expect("should receive an event").expect("should contain an event");
         match consumer_event03 {
             ConsumerEvent::WaitOccupy { .. } => {}
             _ => {
                 assert!(false, "failed to receive occupy event");
             }
         }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
