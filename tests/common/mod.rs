@@ -11,8 +11,10 @@ use tokio::task::JoinHandle;
 use mscheduler::tasker::consumer::{ConsumerEvent, TaskConsumer, TaskConsumerFunc};
 use mscheduler::tasker::task_common::ensure_index;
 
+pub mod test_consume_func;
+
 /// important: clone a collection will not duplicate change stream events
-pub async fn get_collection_for_test<T>(collection_name: impl AsRef<str>) -> Collection<T> {
+pub async fn init_collection_for_test<T>(collection_name: impl AsRef<str>) -> Collection<T> {
     let connection_str = env::var("MongoStr").expect("need mongodb connection str");
     let client_options = if cfg!(windows) && connection_str.contains("+srv") {
         ClientOptions::parse_with_resolver_config(connection_str, ResolverConfig::quad9()).await.unwrap()

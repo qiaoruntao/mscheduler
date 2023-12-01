@@ -5,44 +5,16 @@ mod common;
 mod test {
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use log::info;
-    use serde::{Deserialize, Serialize};
     use tokio::join;
-    use tokio::sync::mpsc::channel;
-    use tokio::time::timeout;
-    use typed_builder::TypedBuilder;
+    use tracing::trace;
 
-    use mscheduler::tasker::consumer::{ConsumerEvent, TaskConsumer, TaskConsumerConfig, TaskConsumerFunc};
-    use mscheduler::tasker::error::MResult;
-    use mscheduler::tasker::error::MSchedulerError::ExecutionError;
+    use mscheduler::tasker::consumer::{ConsumerEvent, TaskConsumer, TaskConsumerConfig};
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task::Task;
 
-    use crate::common::{get_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
-
-    struct TestConsumeFunc {}
-
-    #[derive(Default, TypedBuilder, Clone, Deserialize, Serialize)]
-    #[builder(field_defaults(default, setter(into)))]
-    #[non_exhaustive]
-    struct TestConsumeParam {
-        pub timeout_sec: u32,
-        pub emit_error: bool,
-    }
-
-    #[async_trait]
-    impl TaskConsumerFunc<TestConsumeParam, i32> for TestConsumeFunc {
-        async fn consume(&self, params: Option<TestConsumeParam>) -> MResult<i32> {
-            let param = params.unwrap_or_default();
-            tokio::time::sleep(Duration::from_secs(param.timeout_sec as u64)).await;
-            if param.emit_error {
-                Err(ExecutionError(Box::new("emit error now".to_string())))
-            } else {
-                Ok(param.timeout_sec as i32)
-            }
-        }
-    }
+    use crate::common::{init_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
+    use crate::common::test_consume_func::{TestConsumeFunc, TestConsumeParam};
 
     #[test_log::test(tokio::test)]
     pub async fn test_occupy_task() {
@@ -50,8 +22,8 @@ mod test {
 
         // consumer
         let worker_id1 = "aaa";
-        let task_consumer = TaskConsumer::create(get_collection_for_test(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
-        let task_producer = TaskProducer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await).expect("failed to create producer");
+        let task_consumer = TaskConsumer::create(init_collection_for_test(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
+        let task_producer = TaskProducer::create(init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await).expect("failed to create producer");
         spawn_running_consumer_handler(task_consumer.clone());
 
         // listen to event
@@ -82,12 +54,12 @@ mod test {
         let worker_id1 = "aaa";
         let worker_id2 = "bbb";
         let worker_id3 = "ccc";
-        let task_consumer = TaskConsumer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
-        let task_consumer2 = TaskConsumer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer2");
-        let task_consumer3 = TaskConsumer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id3).build()).await.expect("failed to create consumer3");
+        let task_consumer = TaskConsumer::create(init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
+        let task_consumer2 = TaskConsumer::create(init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer2");
+        let task_consumer3 = TaskConsumer::create(init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id3).build()).await.expect("failed to create consumer3");
 
         // producer
-        let task_producer = TaskProducer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await).expect("failed to create producer");
+        let task_producer = TaskProducer::create(init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await).expect("failed to create producer");
 
         spawn_running_consumer_handler(task_consumer.clone());
         spawn_running_consumer_handler(task_consumer2.clone());
@@ -140,68 +112,102 @@ mod test {
     }
 
     #[test_log::test(tokio::test)]
-    pub async fn test_max_retry_count() {
-        let collection_name = "test_max_retry_count";
-
-        // consumer
-        let worker_id1 = "aaa";
-        let config = TaskConsumerConfig::builder().worker_id(worker_id1).build();
-        let task_consumer = TaskConsumer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await, TestConsumeFunc {}, config).await.expect("failed to create consumer");
+    pub async fn test_occupy_existing_task() {
+        let collection_name = "test_occupy_existing_task";
+        let collection1 = init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await;
+        let collection2 = init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await;
 
         // producer
-        let task_producer = TaskProducer::create(get_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await).expect("failed to create producer");
-
-        // start the producer
-        spawn_running_consumer_handler(task_consumer.clone());
-
-        // wait for multiple occupy event
-        let (tx, mut rx) = channel(100);
-        tokio::spawn({
-            let mut receiver = task_consumer.get_event_receiver();
-            async move {
-                while let Ok(event) = receiver.recv().await {
-                    match &event {
-                        ConsumerEvent::WaitOccupy { .. } => {
-                            tx.send(event).await.expect("failed to store event");
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
+        let task_producer = TaskProducer::create(collection1).expect("failed to create producer");
 
         // send task
         let send_task_option = SendTaskOption::builder().concurrency_cnt(1_u32).worker_timeout_ms(3000_u32).build();
         task_producer.send_task("111", TestConsumeParam::builder().timeout_sec(2_u32).emit_error(true).build(), Some(send_task_option)).await.expect("failed to send task");
-        // tokio::time::sleep(Duration::from_secs(7)).await;
 
-        // wait for task occupy 1
-        let consumer_event01 = timeout(Duration::from_secs(5), rx.recv()).await.expect("should receive an event").expect("should contain an event");
-        match consumer_event01 {
-            ConsumerEvent::WaitOccupy { .. } => {}
-            _ => {
-                assert!(false, "failed to receive occupy event");
+        // consumer
+        let worker_id1 = "aaa";
+        let config = TaskConsumerConfig::builder().worker_id(worker_id1).build();
+        let task_consumer = TaskConsumer::create(collection2, TestConsumeFunc {}, config).await.expect("failed to create consumer");
+
+        // wait for occupy event
+        let occupy_handle = spawn_check_handler(task_consumer.clone(), |event| {
+            match event {
+                ConsumerEvent::TaskOccupyResult { key, success } => {
+                    key == "111" && *success
+                }
+                _ => {
+                    false
+                }
             }
+        }, Duration::from_secs(5));
+
+        // start the producer
+        spawn_running_consumer_handler(task_consumer.clone());
+
+        // wait for task to consumed and success
+        assert!(occupy_handle.await.expect("failed to wait").is_some(), "cannot find success event");
+    }
+
+    #[test_log::test(tokio::test)]
+    pub async fn test_occupy_expired_task() {
+        let collection_name = "test_occupy_expired_task";
+        let collection1 = init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await;
+        let collection2 = init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await;
+        let collection3 = init_collection_for_test::<Task<TestConsumeParam, i32>>(collection_name).await;
+
+        {
+            // producer
+            let task_producer = TaskProducer::create(collection1).expect("failed to create producer");
+
+            // send task
+            let send_task_option = SendTaskOption::builder().concurrency_cnt(1_u32).ping_interval_ms(1_u32).worker_timeout_ms(5_u32).build();
+            // task timeout long enough
+            task_producer.send_task("111", TestConsumeParam::builder().timeout_sec(100_u32).emit_error(true).build(), Some(send_task_option)).await.expect("failed to send task");
         }
 
-        // wait for task occupy 2
-        let consumer_event02 = timeout(Duration::from_secs(5), rx.recv()).await.expect("should receive an event").expect("should contain an event");
-        match consumer_event02 {
-            ConsumerEvent::WaitOccupy { .. } => {}
-            _ => {
-                assert!(false, "failed to receive occupy event");
-            }
-        }
+        // consumer
+        let worker_id1 = "aaa";
+        let task_consumer1 = TaskConsumer::create(collection2, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build().clone()).await.expect("failed to create consumer");
 
-        // wait for task occupy 3
-        let consumer_event03 = timeout(Duration::from_secs(5), rx.recv()).await.expect("should receive an event").expect("should contain an event");
-        match consumer_event03 {
-            ConsumerEvent::WaitOccupy { .. } => {}
-            _ => {
-                assert!(false, "failed to receive occupy event");
+        // wait for occupy event
+        let occupy_handle = spawn_check_handler(task_consumer1.clone(), |event| {
+            match event {
+                ConsumerEvent::TaskOccupyResult { key, success } => {
+                    key == "111" && *success
+                }
+                _ => {
+                    false
+                }
             }
-        }
+        }, Duration::from_secs(5));
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // start the producer
+        let consumer_handler = spawn_running_consumer_handler(task_consumer1.clone());
+
+        // stop consumer immediately after task occupied
+        occupy_handle.await.expect("failed to occupy task").expect("task not occupied");
+        drop(consumer_handler);
+
+        // wait for the task to expire
+        tokio::time::sleep(Duration::from_secs(7)).await;
+
+        // start consumer 2 and wait it to occupy task
+
+        let worker_id2 = "bbb";
+        let task_consumer2 = TaskConsumer::create(collection3, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id2).build()).await.expect("failed to create consumer");
+
+        let occupy_handle2 = spawn_check_handler(task_consumer2.clone(), |event| {
+            trace!("event={}",&event);
+            match event {
+                ConsumerEvent::TaskOccupyResult { key, success } => {
+                    key == "111" && *success
+                }
+                _ => {
+                    false
+                }
+            }
+        }, Duration::from_secs(7));
+        spawn_running_consumer_handler(task_consumer2.clone());
+        occupy_handle2.await.expect("failed to occupy task by 2").expect("task not occupied by 2");
     }
 }

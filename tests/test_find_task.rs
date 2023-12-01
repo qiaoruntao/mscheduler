@@ -14,7 +14,7 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task::Task;
 
-    use crate::common::{get_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
+    use crate::common::{init_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
 
     struct TestConsumeFunc {}
 
@@ -27,8 +27,8 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test() {
-        let collection: Collection<Task<i32, i32>> = get_collection_for_test("test_find_task").await;
-        let collection2: Collection<Task<i32, i32>> = get_collection_for_test("test_find_task").await;
+        let collection: Collection<Task<i32, i32>> = init_collection_for_test("test_find_task").await;
+        let collection2: Collection<Task<i32, i32>> = init_collection_for_test("test_find_task").await;
         // consumer
         let worker_id1 = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");

@@ -62,8 +62,8 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
             let doc = doc! {
                 "$all":[{
                     "$or":[
-                        {"success_time":{"$exists":false}},
-                        {"fail_time":{"$exists":false}},
+                        {"success_time":{"$eq": null}},
+                        {"fail_time":{"$eq": null}},
                     ]
                 }]
             };

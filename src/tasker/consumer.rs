@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use mongodb::bson::{DateTime, doc};
+use mongodb::bson::{DateTime, doc, Document};
 use mongodb::bson::Bson;
 use mongodb::Collection;
 use mongodb::options::{ChangeStreamOptions, FullDocumentType};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use strum::Display;
 use tokio::select;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -21,9 +22,9 @@ use tokio_util::time::DelayQueue;
 use tracing::{error, info, trace, warn};
 use typed_builder::TypedBuilder;
 
-use crate::tasker::consumer::ConsumerEvent::{TaskExecuteResult, TaskOccupyResult, WaitOccupy, WaitOccupyQueueEmpty};
+use crate::tasker::consumer::ConsumerEvent::{MarkSuccess, TaskExecuteResult, TaskOccupyResult, WaitOccupy, WaitOccupyQueueEmpty};
 use crate::tasker::error::{MResult, MSchedulerError};
-use crate::tasker::error::MSchedulerError::{ExecutionError, NoTaskMatched};
+use crate::tasker::error::MSchedulerError::{ExecutionError, MongoDbError, NoTaskMatched};
 use crate::tasker::task::Task;
 
 #[async_trait]
@@ -31,7 +32,7 @@ pub trait TaskConsumerFunc<T: Send, K: Send>: Send + Sync + 'static {
     async fn consume(&self, params: Option<T>) -> MResult<K>;
 }
 
-#[derive(Deserialize, TypedBuilder, Debug)]
+#[derive(Deserialize, TypedBuilder, Debug, Clone)]
 #[builder(field_defaults(default, setter(into)))]
 #[non_exhaustive]
 pub struct TaskConsumerConfig {
@@ -84,7 +85,7 @@ struct NextDoc {
 }
 
 /// used to notify both inner and outer receivers
-#[derive(Clone)]
+#[derive(Clone, Debug, Display)]
 pub enum ConsumerEvent {
     WaitOccupy {
         key: String,
@@ -96,6 +97,10 @@ pub enum ConsumerEvent {
         success: bool,
     },
     TaskExecuteResult {
+        key: String,
+    },
+    /// send this event when task is marked as success
+    MarkSuccess {
         key: String,
     },
 }
@@ -175,17 +180,6 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
-    async fn spawn_postprocessing(state: Arc<SharedConsumerState<T, K, Func>>) {
-        trace!("spawn_postprocessing");
-        let mut receiver = state.consumer_event_sender.subscribe();
-        while let Ok(consumer_event) = receiver.recv().await {
-            match &consumer_event {
-                TaskExecuteResult { .. } => {}
-                _ => {}
-            }
-        }
-    }
-
     async fn spawn_occupy(state: Arc<SharedConsumerState<T, K, Func>>) {
         trace!("spawn_occupy");
         let mut receiver = state.consumer_event_sender.subscribe();
@@ -195,7 +189,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             select! {
                 Ok(consumer_event) = receiver.recv()=>{
                     match &consumer_event {
-                        ConsumerEvent::WaitOccupy { key, next_occupy_time } => {
+                        WaitOccupy { key, next_occupy_time } => {
                             let wait_ms = next_occupy_time.timestamp_millis() - DateTime::now().timestamp_millis();
                             let wait_ms = wait_ms.max(0);
                             queue.insert(key.clone(), Duration::from_millis(wait_ms as u64));
@@ -258,8 +252,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             "key": key.as_ref(),
             "task_state.worker_states.worker_id": &state.config.worker_id,
             "task_state.worker_states.running_id": &running_id,
-            "task_state.worker_states.fail_time": {"$exists":false},
-            "task_state.worker_states.success_time": {"$exists":false}
+            "task_state.worker_states.fail_time": {"$eq":null},
+            "task_state.worker_states.success_time": {"$eq":null}
         };
         let update = doc! {
             "$set":{
@@ -269,6 +263,9 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let task = match state.collection.find_one_and_update(filter, update, None).await {
             Ok(Some(v)) => {
                 trace!("mark as success succeeded key={}",key.as_ref());
+                if let Err(e) = state.consumer_event_sender.send(MarkSuccess { key: key.as_ref().to_string() }) {
+                    error!("failed to send success event {}", &e);
+                }
                 v
             }
             Ok(None) => {
@@ -293,8 +290,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 "$elemMatch": {
                     "running_id": &running_id,
                     "worker_id": &state.config.worker_id,
-                    "fail_time": {"$exists": false},
-                    "success_time": {"$exists": false}
+                    "fail_time": {"$eq": null},
+                    "success_time": {"$eq": null}
                 }
             }
         };
@@ -303,7 +300,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 "task_state.worker_states.$.fail_time":DateTime::now(),
             }
         };
-        trace!("{}", &filter);
+        trace!("mark_task_fail {}", &filter);
         let task = match state.collection.find_one_and_update(filter, update, None).await {
             Ok(Some(v)) => {
                 trace!("mark as failed succeed key={}",key.as_ref());
@@ -345,56 +342,16 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     async fn occupy_task(state: Arc<SharedConsumerState<T, K, Func>>, task_key: impl AsRef<str>) -> MResult<(Task<T, K>, String)> {
         let worker_id = &state.config.worker_id;
         let task_key = task_key.as_ref();
-        trace!("try_occupy_task now key={}", task_key);
+        trace!("try_occupy_task now key={} {}", task_key, worker_id);
         let all_conditions = vec![
+            // match key
             doc! {"key":task_key},
             // max retry check
-            doc! {
-                "$expr": {
-                    "$lt": [{
-                        "$size": {
-                            "$filter": {
-                                "input": "$task_state.worker_states",
-                                "as": "item",
-                                "cond": {"$and":[
-                                  { "$eq": ["$$item.worker_id", worker_id]  },
-                                  { "$ne": ["$$item.fail_time", Bson::Null] },
-                                ]}
-                            }
-                        }
-                    }, "$task_option.max_unexpected_retries"]
-                }
-            },
+            Self::verify_max_retry_cnt(worker_id),
+            // double occupy check
+            Self::verify_double_occupy(worker_id),
             // concurrent limit check
-            doc! {
-                "$expr": {
-                    "$lt": [{
-                        "$size": {
-                            "$filter": {
-                                "input": "$task_state.worker_states",
-                                "as": "item",
-                                "cond": {"$or":[
-                                    // running
-                                    {
-                                        "$and":[
-                                            { "$gt": ["$$item.ping_expire_time", DateTime::now()] },
-                                            { "$eq": ["$$item.success_time", Bson::Null] },
-                                            { "$eq": ["$$item.fail_time", Bson::Null] },
-                                        ]
-                                    },
-                                    // success
-                                    {
-                                        "$and":[
-                                            { "$ne": ["$$item.success_time", Bson::Null] },
-                                            { "$eq": ["$$item.fail_time", Bson::Null] },
-                                        ]
-                                    }
-                                ]}
-                            }
-                        }
-                    }, "$task_option.concurrent_worker_cnt"]
-                }
-            },
+            Self::verify_concurrent_limit_check(true),
         ];
         let expire_time = DateTime::from_millis(DateTime::now().timestamp_millis() + 10_000i64);
         // some information on how to push elements into array
@@ -418,6 +375,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                             "running_id": &running_id,
                             "worker_id": worker_id,
                             "ping_expire_time": expire_time,
+                            "success_time": Bson::Null,
+                            "fail_time": Bson::Null,
                         }]]
                     }
                 }
@@ -448,6 +407,150 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         }
     }
 
+    fn verify_concurrent_limit_check(check_running: bool) -> Document {
+        let mut conditions = vec![
+            // success
+            doc! {
+                "$and": [
+                    {
+                        "$ne": [
+                        "$$item.success_time", Bson::Null]
+                    },
+                    {
+                        "$eq": [
+                        "$$item.fail_time", Bson::Null]
+                    },
+                ]
+            },
+        ];
+        // running
+        if check_running {
+            conditions.push(doc! {
+                "$and": [
+                    {
+                        "$gt": [
+                        "$$item.ping_expire_time", DateTime::now()]
+                    },
+                    {
+                        "$eq": [
+                        "$$item.success_time", Bson::Null]
+                    },
+                    {
+                        "$eq": [
+                        "$$item.fail_time", Bson::Null]
+                    },
+                ]
+            });
+        }
+        doc! {
+            "$expr": {
+                "$lt": [{
+                    "$size": {
+                        "$filter": {
+                            "input": "$task_state.worker_states",
+                            "as": "item",
+                            "cond": {"$or":conditions}
+                        }
+                    }
+                }, "$task_option.concurrent_worker_cnt"]
+            }
+        }
+    }
+
+    fn verify_double_occupy(worker_id: &String) -> Document {
+        doc! {
+                "$expr": {
+                    "$eq": [{
+                        "$size": {
+                            "$filter": {
+                                "input": "$task_state.worker_states",
+                                "as": "item",
+                                "cond": {"$and":[
+                                    // running
+                                    { "$gt": ["$$item.ping_expire_time", DateTime::now()] },
+                                    { "$eq": ["$$item.success_time", Bson::Null] },
+                                    { "$eq": ["$$item.fail_time", Bson::Null] },
+                                    // and belong to this worker
+                                    { "$eq": ["$$item.worker_id", worker_id]  },
+                                ]}
+                            }
+                        }
+                    }, 0]
+                }
+            }
+    }
+
+    fn verify_max_retry_cnt(worker_id: &String) -> Document {
+        doc! {
+                "$expr": {
+                    "$lt": [{
+                        "$size": {
+                            "$filter": {
+                                "input": "$task_state.worker_states",
+                                "as": "item",
+                                "cond": {"$and":[
+                                  { "$eq": ["$$item.worker_id", worker_id]  },
+                                  { "$ne": ["$$item.fail_time", Bson::Null] },
+                                ]}
+                            }
+                        }
+                    }, "$task_option.max_unexpected_retries"]
+                }
+            }
+    }
+
+    async fn fetch_task(state: Arc<SharedConsumerState<T, K, Func>>) -> MResult<()> {
+        let worker_id = &state.config.worker_id;
+
+        let all_conditions = vec![
+            // max retry check
+            Self::verify_max_retry_cnt(worker_id),
+            // double occupy check
+            Self::verify_double_occupy(worker_id),
+            // concurrent limit check
+            Self::verify_concurrent_limit_check(false),
+        ];
+        let filter = doc! {"$and":all_conditions};
+        trace!("fetch_task {}", &filter);
+        let mut cursor = match state.collection.find(filter, None).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("failed to fetch more tasks {}",e);
+                return Err(MongoDbError(Arc::new(e)));
+            }
+        };
+        for _ in 0..10 {
+            match cursor.next().await {
+                None => {
+                    trace!("all remaining tasks scanned");
+                    state.is_fully_scanned.store(true, SeqCst);
+                    break;
+                }
+                Some(Err(e)) => {
+                    error!("failed to get more existing tasks {}", e);
+                    break;
+                }
+                Some(Ok(task)) => {
+                    let event = match TaskConsumer::<T, K, Func>::infer_consumer_event_from_task(task) {
+                        None => {
+                            trace!("task scanned no event is inferred");
+                            continue;
+                        }
+                        Some(v) => {
+                            trace!("task scanned event is inferred {:?}", &v);
+                            v
+                        }
+                    };
+                    if let Err(e) = state.consumer_event_sender.send(event) {
+                        error!("failed to add new scanned task {}",&e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn spawn_fetch_db(state: Arc<SharedConsumerState<T, K, Func>>) -> MResult<()> {
         trace!("spawn_fetch_db");
         let mut receiver = state.consumer_event_sender.subscribe();
@@ -458,7 +561,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                         continue;
                     }
                     info!("start to fetch db");
-                    // TODO: fetch db
+                    let _ = TaskConsumer::fetch_task(state.clone()).await;
                 }
                 _ => {}
             }
@@ -470,6 +573,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         trace!("spawn_listen_db");
         // clone a receiver for this session
         let event_sender = state.consumer_event_sender.clone();
+        let worker_id = &state.config.worker_id;
         // open change stream
         let change_stream_options = ChangeStreamOptions::builder()
             .full_document(Some(FullDocumentType::UpdateLookup))
@@ -481,8 +585,13 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     "task_option":"$fullDocument.task_option"
                 }
             },
-            // check both running and created tasks,
-            // Self::gen_pipeline(config, false),
+            // filter some unnecessary task updates
+            doc! {
+                "$match":{
+                    // avoid try to occupy already occupied task
+                    "$and":[Self::verify_double_occupy(worker_id)]
+                }
+            },
             doc! {
                 "$project":{
                     // _id cannot get filtered, will get error if filtered
@@ -502,13 +611,16 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 return Err(MSchedulerError::MongoDbError(e.into()));
             }
         };
+
         // keep track if we checked all existing tasks, and whether we could listen to change stream only.
         // after change stream restarts, we assume some tasks may be updated during the restart gap
         state.is_fully_scanned.store(false, SeqCst);
+
         // send a fetch request to fill up some tasks
-        // let _ = event_sender.send(WaitOccupyQueueEmpty).await
-        //     .map_err(|e| error!("failed to fill up task queue at the start of change stream {}",e));
+        let _ = event_sender.send(WaitOccupyQueueEmpty)
+            .map_err(|e| error!("failed to fill up task queue at the start of change stream {}",e));
         info!("start to listen to change stream");
+
         // listen to change event and send them to next processing stage
         while let Some(event) = change_stream.next().await {
             let change_stream_event = match event {
@@ -527,7 +639,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     v
                 }
             };
-            info!("key ={}",&task.key);
+            info!("stream found key ={}",&task.key);
             let consumer_event = match TaskConsumer::<T, K, Func>::infer_consumer_event_from_task(task) {
                 None => {
                     // this is normal
@@ -550,7 +662,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 max_time = max_time.max(t);
             }
         }
-        let event = ConsumerEvent::WaitOccupy {
+        let event = WaitOccupy {
             key: task.key,
             next_occupy_time: max_time,
         };
