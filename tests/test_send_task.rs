@@ -7,11 +7,11 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task_common::ensure_index;
 
-    use crate::common::get_collection_for_test;
+    use crate::common::init_collection_for_test;
 
     #[tokio::test]
     async fn test_send_new_task() {
-        let collection = get_collection_for_test("test_send_new_task").await;
+        let collection = init_collection_for_test("test_send_new_task").await;
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
@@ -29,7 +29,7 @@ mod test {
 
     #[tokio::test]
     async fn test_send_duplicate_task() {
-        let collection = get_collection_for_test("test_send_duplicate_task").await;
+        let collection = init_collection_for_test("test_send_duplicate_task").await;
         collection.delete_many(doc! {}, None).await.expect("failed to clear collection");
         ensure_index(&collection).await;
 
@@ -50,7 +50,7 @@ mod test {
         assert!(task.params.is_some());
         assert_eq!(task.params.unwrap(), random);
         assert_eq!(task.key, key);
-        let mut send_task_option = SendTaskOption::default();
+        let mut send_task_option = SendTaskOption::builder().build();
         send_task_option.update_existing_params = true;
         // reinsert task with a different parameter, but specific to update parameter
         task_producer.send_task(key, random + 1, Some(send_task_option)).await.expect("failed to send new task");
@@ -60,7 +60,7 @@ mod test {
         assert_eq!(task.key, key);
         // reinsert task with a different parameter, but specific to update parameter
         let run_time = DateTime::parse_rfc3339_str("2030-04-12T23:20:50.52Z").unwrap();
-        let mut send_task_option = SendTaskOption::default();
+        let mut send_task_option = SendTaskOption::builder().build();
         send_task_option.run_time = Some(run_time);
         // reinsert task with a different run time
         let send_task_result = task_producer.send_task(key, random + 1, Some(send_task_option)).await.expect("failed to send new task");
