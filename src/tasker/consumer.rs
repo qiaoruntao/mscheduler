@@ -6,7 +6,8 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{future, FutureExt, pin_mut, StreamExt};
+use futures::future::Either::{Left, Right};
 use mongodb::bson::{DateTime, doc, Document};
 use mongodb::bson::Bson;
 use mongodb::Collection;
@@ -17,6 +18,7 @@ use strum::Display;
 use tokio::select;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tokio_util::time::delay_queue::Expired;
 use tokio_util::time::DelayQueue;
 use tracing::{error, info, trace, warn};
@@ -246,15 +248,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     /// no need to store result
     async fn mark_task_success(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, running_id: String) -> MResult<Task<T, K>> {
-        // the filter should the specific running task.
-        // however we loose the restriction to not fail or success
-        let filter = doc! {
-            "key": key.as_ref(),
-            "task_state.worker_states.worker_id": &state.config.worker_id,
-            "task_state.worker_states.running_id": &running_id,
-            "task_state.worker_states.fail_time": {"$eq":null},
-            "task_state.worker_states.success_time": {"$eq":null}
-        };
+        // the filter matches specific running task.
+        let filter = Self::verify_matched_running_task(&state, &key, &running_id);
         let update = doc! {
             "$set":{
                 "task_state.worker_states.$.success_time":DateTime::now(),
@@ -284,17 +279,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     async fn mark_task_fail(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, running_id: String) -> MResult<Task<T, K>> {
         // the filter should the specific running task.
         // however we loose the restriction to not fail or success
-        let filter = doc! {
-            "key": key.as_ref(),
-            "task_state.worker_states":{
-                "$elemMatch": {
-                    "running_id": &running_id,
-                    "worker_id": &state.config.worker_id,
-                    "fail_time": {"$eq": null},
-                    "success_time": {"$eq": null}
-                }
-            }
-        };
+        let filter = Self::verify_matched_running_task(&state, &key, &running_id);
         let update = doc! {
             "$set":{
                 "task_state.worker_states.$.fail_time":DateTime::now(),
@@ -318,12 +303,61 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         Ok(task)
     }
 
+    fn verify_matched_running_task(state: &Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, running_id: impl AsRef<str>) -> Document {
+        let filter = doc! {
+            "key": key.as_ref(),
+            "task_state.worker_states":{
+                "$elemMatch": {
+                    "running_id": running_id.as_ref(),
+                    "worker_id": &state.config.worker_id,
+                    "fail_time": {"$eq": null},
+                    "success_time": {"$eq": null}
+                }
+            }
+        };
+        filter
+    }
+
     async fn execute_task(state: Arc<SharedConsumerState<T, K, Func>>, task: Task<T, K>, running_id: String) {
         let key = task.key;
         let join_handle = tokio::spawn({
             let state = state.clone();
             let key = key.clone();
-            async move {
+
+            let ping_logic = {
+                let key = key.clone();
+                let state = state.clone();
+                let running_id = running_id.clone();
+                let worker_timeout_ms = task.task_option.worker_timeout_ms;
+                let ping_interval_ms = task.task_option.ping_interval_ms;
+                // 3 to ensure not accidentally exit
+                let max_fail_cnt = worker_timeout_ms.div_ceil(ping_interval_ms).max(3);
+                let mut continuous_fail_cnt = 0;
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_millis(ping_interval_ms as u64));
+                    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        match TaskConsumer::ping_task(state.clone(), &key, &running_id, worker_timeout_ms).await {
+                            Ok(_) => {}
+                            Err(NoTaskMatched) => {
+                                trace!("failed to find task to ping key={}", &key);
+                                // cannot find matched task, exit immediately
+                                return MResult::<()>::Err(NoTaskMatched);
+                            }
+                            Err(e) => {
+                                // keep trying until thread meets
+                                continuous_fail_cnt += 1;
+                                if continuous_fail_cnt >= max_fail_cnt {
+                                    error!("max ping retry encountered, exit now");
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let main_processing_logic = async move {
                 trace!("start to consume task now key={}", &key);
                 let result = state.func.consume(task.params).await;
                 trace!("task consumed key={}", &key);
@@ -334,9 +368,51 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     error!("failed to send post process event {}",e);
                 }
                 result
+            };
+            let result_value = select! {
+                _=ping_logic=>{
+                    Err(MSchedulerError::PanicError)
+                }
+                result=main_processing_logic=>{
+                    result
+                }
+            };
+            async move {
+                result_value
             }
         });
         state.task_map.lock().expect("failed to lock task_map").insert(key, join_handle);
+    }
+
+    async fn ping_task(state: Arc<SharedConsumerState<T, K, Func>>, key: impl AsRef<str>, running_id: impl AsRef<str>, worker_timeout_ms: u32) -> MResult<Task<T, K>> {
+        let task_key = key.as_ref();
+        let running_id = running_id.as_ref();
+        let next_expire_time = DateTime::from_millis(DateTime::now().timestamp_millis() + worker_timeout_ms as i64);
+
+        let filter = Self::verify_matched_running_task(&state, &task_key, &running_id);
+        let update = doc! {
+            "$set":{
+                "task_state.worker_states.$.ping_expire_time":next_expire_time,
+            }
+        };
+        match state.collection.find_one_and_update(filter, update, None).await {
+            Ok(Some(v)) => {
+                trace!("successfully ping task key={}", &task_key);
+                Ok(v)
+            }
+            Ok(None) => {
+                trace!("failed to occupy task key={} cannot get matched task", task_key);
+                // no need to report failed to compete with other workers
+                Err(NoTaskMatched)
+            }
+            Err(e) => {
+                if let Err(e) = state.consumer_event_sender.send(TaskOccupyResult { key: task_key.to_string(), success: false }) {
+                    error!("failed to send occupy success event {}",e);
+                }
+                error!("failed to occupy task {}",&e);
+                Err(ExecutionError(Box::new(e)))
+            }
+        }
     }
 
     async fn occupy_task(state: Arc<SharedConsumerState<T, K, Func>>, task_key: impl AsRef<str>) -> MResult<(Task<T, K>, String)> {
