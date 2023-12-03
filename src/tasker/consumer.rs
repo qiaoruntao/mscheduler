@@ -6,8 +6,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::{future, FutureExt, pin_mut, StreamExt};
-use futures::future::Either::{Left, Right};
+use futures::StreamExt;
 use mongodb::bson::{DateTime, doc, Document};
 use mongodb::bson::Bson;
 use mongodb::Collection;
@@ -323,7 +322,6 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let join_handle = tokio::spawn({
             let state = state.clone();
             let key = key.clone();
-
             let ping_logic = {
                 let key = key.clone();
                 let state = state.clone();
@@ -357,30 +355,37 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     }
                 }
             };
-            let main_processing_logic = async move {
-                trace!("start to consume task now key={}", &key);
-                let result = state.func.consume(task.params).await;
-                trace!("task consumed key={}", &key);
-                // post processing in this thread
-                let _ = TaskConsumer::postprocess_task(state.clone(), key.clone(), &result, running_id).await;
-                // send event
-                if let Err(e) = state.consumer_event_sender.send(TaskExecuteResult { key: key.clone() }) {
-                    error!("failed to send post process event {}",e);
-                }
-                result
-            };
-            let result_value = select! {
-                _=ping_logic=>{
-                    Err(MSchedulerError::PanicError)
-                }
-                result=main_processing_logic=>{
+            let main_processing_logic = {
+                let key = key.clone();
+                let state = state.clone();
+                async move {
+                    trace!("start to consume task now key={}", &key);
+                    let result = state.func.consume(task.params).await;
+                    trace!("task consumed key={}", &key);
+                    // post processing in this thread
+                    let _ = TaskConsumer::postprocess_task(state.clone(), key.clone(), &result, running_id).await;
+                    // send event
+                    if let Err(e) = state.consumer_event_sender.send(TaskExecuteResult { key: key.clone() }) {
+                        error!("failed to send post process event {}",e);
+                    }
                     result
                 }
             };
             async move {
+                let result_value = select! {
+                    _=ping_logic=>{
+                        Err(MSchedulerError::PanicError)
+                    }
+                    result=main_processing_logic=>{
+                        result
+                    }
+                };
+                // trace!("task_map removed");
+                state.task_map.lock().expect("failed to lock task_map").remove(&key);
                 result_value
             }
         });
+        // trace!("task_map added");
         state.task_map.lock().expect("failed to lock task_map").insert(key, join_handle);
     }
 
@@ -684,7 +689,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             Ok(v) => { v }
             Err(e) => {
                 error!("failed to open change stream {}",e);
-                return Err(MSchedulerError::MongoDbError(e.into()));
+                return Err(MongoDbError(e.into()));
             }
         };
 

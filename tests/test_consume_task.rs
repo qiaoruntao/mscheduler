@@ -217,14 +217,14 @@ mod test {
         // wait for the consumer to complete all tasks
         tokio::time::sleep(Duration::from_secs(2)).await;
         // task should all be consumed
-        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").is_none());
+        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$eq":null}}, None).await.expect("failed to find").is_none());
         // spawn more
         task_producer.send_task("113", 0, None).await.expect("failed to send task");
         task_producer.send_task("114", 0, None).await.expect("failed to send task");
         // wait for the consumer to complete all tasks
         tokio::time::sleep(Duration::from_secs(2)).await;
         // task should all be consumed
-        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").is_none());
+        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$eq":null}}, None).await.expect("failed to find").is_none());
     }
 
     #[test_log::test(tokio::test)]
@@ -240,7 +240,7 @@ mod test {
         // wait for the consumer to occupy the task
         tokio::time::sleep(Duration::from_secs(1)).await;
         // task should be running
-        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").is_some());
+        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$eq":null}}, None).await.expect("failed to find").is_some());
         // send task which will not update the running task
         let send_result = task_producer.send_task("111", 1, Some(SendTaskOption::builder().not_update_running(true).build())).await;
         assert!(send_result.is_err(), "send task not expected to success");
@@ -248,7 +248,7 @@ mod test {
         assert!(matches!(err, MSchedulerError::DuplicatedTaskId), "send task should fail due to no find any matching task");
         // wait for the consumer to complete the task
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").is_none(), "task should be consumed");
+        assert!(collection.find_one(doc! {"task_state.worker_states.success_time":{"$eq":null}}, None).await.expect("failed to find").is_none(), "task should be consumed");
         // send task which will not update the running task
         let send_result = task_producer.send_task("111", 1, None).await;
         assert!(send_result.is_ok(), "send task expected to success");
@@ -261,7 +261,7 @@ mod test {
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
         // init collection with some tasks
         let send_task_option = SendTaskOption::builder().ping_interval_ms(1000_u32).worker_timeout_ms(2500_u32).build();
-        task_producer.send_task("111", -5, Some(send_task_option)).await.expect("failed to send task");
+        task_producer.send_task("111", -6, Some(send_task_option)).await.expect("failed to send task");
         let worker_id01 = "aaa";
         // start the consumer
         let task_consumer1 = TaskConsumer::create(collection.clone(), TestConsumeWithTimeParamFunc {}, TaskConsumerConfig::builder().worker_id(worker_id01).build()).await.expect("failed to create consumer01");
@@ -279,11 +279,11 @@ mod test {
             async move { task_consumer2.start().await }
         });
         // task should be running
-        let task_time01 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").expect("failed to get task");
+        let task_time01 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$eq":null}}, None).await.expect("failed to find").expect("failed to get task");
         let first_ping_expire_time = task_time01.task_state.worker_states.get(0).unwrap().ping_expire_time;
         // wait for a while and check ping time again
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let task_time02 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$exists":false}}, None).await.expect("failed to find").expect("failed to get task");
+        let task_time02 = collection.find_one(doc! {"task_state.worker_states.success_time":{"$eq":null}}, None).await.expect("failed to find").expect("failed to get task");
         let second_ping_expire_time = task_time02.task_state.worker_states.get(0).unwrap().ping_expire_time;
         assert_ne!(first_ping_expire_time, second_ping_expire_time, "ping expire time not updated");
         assert_eq!(task_consumer1.get_running_task_cnt(), 1, "consumer 1 task should still be running");

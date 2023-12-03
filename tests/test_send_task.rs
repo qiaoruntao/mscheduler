@@ -44,7 +44,7 @@ mod test {
         assert_eq!(task.key, key);
         assert!(!send_task_result.update_existing);
         assert!(send_task_result.insert_new);
-        // reinsert task with a different parameter, but no specific to update parameter
+        // reinsert task with a different parameter, but not specify to update parameter
         task_producer.send_task(key, random + 1, None).await.expect("failed to send new task");
         let task = collection.find_one(doc! {"key":key}, None).await.expect("failed to find new task in db").expect("no task returns");
         assert!(task.params.is_some());
