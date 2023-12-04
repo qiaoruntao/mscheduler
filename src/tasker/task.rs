@@ -44,8 +44,6 @@ pub struct TaskOption {
     pub ping_interval_ms: u32,
     // after which time other worker can replace timeout worker
     pub worker_timeout_ms: u32,
-    // minimum worker version to run this task
-    pub min_worker_version: u32,
     // only allow these workers to run this task
     pub specific_worker_ids: Vec<String>,
     // how many unexpected error are allowed to occur

@@ -36,18 +36,11 @@ pub trait TaskConsumerFunc<T: Send, K: Send>: Send + Sync + 'static {
 #[builder(field_defaults(default, setter(into)))]
 #[non_exhaustive]
 pub struct TaskConsumerConfig {
-    // specific this worker's version, used to choose which task to run
-    #[builder(default = 0)]
-    pub worker_version: u32,
     // specific this worker's id, used to remote control worker behavior, also can be used to choose which task to run
     pub worker_id: String,
 }
 
 impl TaskConsumerConfig {
-    pub fn get_worker_version(&self) -> u32 {
-        self.worker_version
-    }
-
     pub fn get_worker_id(&self) -> &str {
         self.worker_id.as_str()
     }
@@ -345,74 +338,73 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
 
     async fn execute_task(state: Arc<SharedConsumerState<T, K, Func>>, task: Task<T, K>, running_id: String) {
         let key = task.key;
-        let join_handle = tokio::spawn({
-            let state = state.clone();
+        let ping_logic = {
             let key = key.clone();
-            let ping_logic = {
-                let key = key.clone();
-                let state = state.clone();
-                let running_id = running_id.clone();
-                let worker_timeout_ms = task.task_option.worker_timeout_ms;
-                let ping_interval_ms = task.task_option.ping_interval_ms;
-                // 3 to ensure not accidentally exit
-                let max_fail_cnt = worker_timeout_ms.div_ceil(ping_interval_ms).max(3);
-                let mut continuous_fail_cnt = 0;
-                async move {
-                    let mut interval = tokio::time::interval(Duration::from_millis(ping_interval_ms as u64));
-                    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                    loop {
-                        interval.tick().await;
-                        match TaskConsumer::ping_task(state.clone(), &key, &running_id, worker_timeout_ms).await {
-                            Ok(_) => {}
-                            Err(NoTaskMatched) => {
-                                trace!("failed to find task to ping key={}", &key);
-                                // cannot find matched task, exit immediately
-                                return MResult::<()>::Err(NoTaskMatched);
-                            }
-                            Err(e) => {
-                                // keep trying until thread meets
-                                continuous_fail_cnt += 1;
-                                if continuous_fail_cnt >= max_fail_cnt {
-                                    error!("max ping retry encountered, exit now");
-                                    return Err(e);
-                                }
+            let state = state.clone();
+            let running_id = running_id.clone();
+            let worker_timeout_ms = task.task_option.worker_timeout_ms;
+            let ping_interval_ms = task.task_option.ping_interval_ms;
+            // 3 to ensure not accidentally exit
+            let max_fail_cnt = worker_timeout_ms.div_ceil(ping_interval_ms).max(3);
+            let mut continuous_fail_cnt = 0;
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(ping_interval_ms as u64));
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    match TaskConsumer::ping_task(state.clone(), &key, &running_id, worker_timeout_ms).await {
+                        Ok(_) => {}
+                        Err(NoTaskMatched) => {
+                            trace!("failed to find task to ping key={}", &key);
+                            // cannot find matched task, exit immediately
+                            return MResult::<()>::Err(NoTaskMatched);
+                        }
+                        Err(e) => {
+                            // keep trying until thread meets
+                            continuous_fail_cnt += 1;
+                            if continuous_fail_cnt >= max_fail_cnt {
+                                error!("max ping retry encountered, exit now");
+                                return Err(e);
                             }
                         }
                     }
                 }
-            };
-            let main_processing_logic = {
-                let key = key.clone();
-                let state = state.clone();
-                let running_id = running_id.clone();
-                async move {
-                    trace!("start to consume task now key={}", &key);
-                    let result = state.func.consume(task.params).await;
-                    trace!("task consumed key={}", &key);
-                    // post processing in this thread
-                    let _ = TaskConsumer::postprocess_task(state.clone(), key.clone(), &result, running_id).await;
-                    // send event
-                    if let Err(e) = state.consumer_event_sender.send(TaskExecuteResult { key: key.clone() }) {
-                        error!("failed to send post process event {}",e);
-                    }
-                    result
+            }
+        };
+        let consume_logic = {
+            let key = key.clone();
+            let state = state.clone();
+            let running_id = running_id.clone();
+            async move {
+                trace!("start to consume task now key={}", &key);
+                let result = state.func.consume(task.params).await;
+                trace!("task consumed key={}", &key);
+                // post processing in this thread
+                let _ = TaskConsumer::postprocess_task(state.clone(), key.clone(), &result, running_id).await;
+                // send event
+                if let Err(e) = state.consumer_event_sender.send(TaskExecuteResult { key: key.clone() }) {
+                    error!("failed to send post process event {}",e);
                 }
-            };
+                result
+            }
+        };
+        let execution_logic = {
+            let key = key.clone();
+            let state = state.clone();
             async move {
                 let result_value = select! {
                     _=ping_logic=>{
                         Err(MSchedulerError::PanicError)
                     }
-                    result=main_processing_logic=>{
+                    result=consume_logic=>{
                         result
                     }
                 };
-                // trace!("task_map removed");
                 state.task_map.lock().expect("failed to lock task_map").remove(&key);
                 result_value
             }
-        });
-        // trace!("task_map added");
+        };
+        let join_handle = tokio::spawn(execution_logic);
         state.task_map.lock().expect("failed to lock task_map").insert(key, (join_handle, running_id));
     }
 
@@ -589,6 +581,19 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
             }
     }
 
+    /// if this passes, then this worker can run this task
+    fn verify_allowed_worker_id(worker_id: &String) -> Document {
+        doc! {
+            "$or": [
+                {
+                    "task_option.specific_worker_ids": { "$eq": [] }
+                },
+                {
+                    "task_option.specific_worker_ids": { "$in": [worker_id] }
+                }
+            ]
+        }
+    }
 
     /// if this passes, not completely failed
     /// NOTE: we only need to consider this worker, we cannot interface other worker's retry count
@@ -635,6 +640,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
         let all_conditions = vec![
             // not completely success
             Self::verify_not_completely_success(),
+            // check if worker id is allowed
+            Self::verify_allowed_worker_id(worker_id),
             // max retry check
             Self::verify_not_completely_failed(worker_id),
             // double occupy check
@@ -730,6 +737,8 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                     "$and":[
                         // avoid try to occupy already occupied task
                         Self::verify_double_occupy(worker_id),
+                        // check if worker id is allowed
+                        Self::verify_allowed_worker_id(worker_id),
                         // not completely success, so we have a chance to occupy
                         Self::verify_not_completely_success(),
                         // not completely failed, so we have a chance to occupy

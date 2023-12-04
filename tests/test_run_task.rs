@@ -12,7 +12,7 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task::Task;
 
-    use crate::common::{init_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
+    use crate::common::test::{init_collection_for_test, spawn_check_handler, spawn_running_consumer_handler};
     use crate::common::test_consume_func::{TestConsumeFunc, TestConsumeParam};
 
     // test whether fail task is ok

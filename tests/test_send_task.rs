@@ -6,8 +6,7 @@ mod test {
 
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task_common::ensure_index;
-
-    use crate::common::init_collection_for_test;
+    use crate::common::test::init_collection_for_test;
 
     #[tokio::test]
     async fn test_send_new_task() {

@@ -26,13 +26,13 @@ pub struct SendTaskOption {
     // how many concurrency workers are allowed
     #[builder(default = 1)]
     pub concurrency_cnt: u32,
-    #[builder(default = 0)]
-    pub min_worker_version: u32,
     // do not find and do anything to a running task
     #[builder(default = true)]
     pub not_update_running: bool,
     #[builder(default = 30_000)]
     pub ping_interval_ms: u32,
+    #[builder(default = vec![])]
+    pub specific_worker_ids: Vec<String>,
     // clean up existing task's success worker states
     // pub clean_success: bool,
     // clean up existing task's failed worker states
@@ -79,8 +79,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
             concurrent_worker_cnt: send_option.concurrency_cnt,
             ping_interval_ms: send_option.ping_interval_ms,
             worker_timeout_ms: send_option.worker_timeout_ms,
-            min_worker_version: send_option.min_worker_version,
-            specific_worker_ids: vec![],
+            specific_worker_ids: send_option.specific_worker_ids,
             max_unexpected_retries: 3,
             unexpected_retry_delay_ms: 10_000,
         };
@@ -90,7 +89,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
                 "task_state.create_time":now,
                 "task_state.start_time":start_time,
                 "task_state.worker_states":[],
-                "task_option":to_document(&task_option).unwrap(),
+                "task_option":to_document(&task_option).expect("cannot convert to task_option"),
             },
         };
         let mut updates = vec![];

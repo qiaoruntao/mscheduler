@@ -69,7 +69,7 @@ mod test {
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
 
     use crate::{TestConsumeFailFunc, TestConsumeFunc, TestConsumeWithTimeParamFunc, TestStringConsumeFunc};
-    use crate::common::init_collection_for_test;
+    use crate::common::test::init_collection_for_test;
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_task() {
@@ -172,15 +172,16 @@ mod test {
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_task_worker_id() {
-        let collection = init_collection_for_test("test_consume_task_worker_priority").await;
+        let collection = init_collection_for_test("test_consume_task_worker_id").await;
         let worker_id1 = "aaa";
         let task_consumer = TaskConsumer::create(collection.clone(), TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build()).await.expect("failed to create consumer");
         tokio::spawn(async move { task_consumer.start().await });
 
         let task_producer = TaskProducer::create(collection.clone()).expect("failed to create producer");
-        let mut send_task_option = SendTaskOption::builder().build();
-        send_task_option.concurrency_cnt = 1;
-        send_task_option.min_worker_version = 1;
+        let send_task_option = SendTaskOption::builder()
+            .concurrency_cnt(1_u32)
+            .specific_worker_ids(vec!["bbb".to_string()])
+            .build();
         task_producer.send_task("111", 1, Some(send_task_option)).await.expect("failed to send task");
         tokio::time::sleep(Duration::from_secs(1)).await;
         // task should not be consumed
@@ -189,7 +190,6 @@ mod test {
         // spawn a matched consumer
         let worker_id2 = "bbb";
         let config2 = TaskConsumerConfig::builder()
-            .worker_version(1u32)
             .worker_id(worker_id2)
             .build();
         assert_eq!(config2.get_worker_id(), worker_id2);
