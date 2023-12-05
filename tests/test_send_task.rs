@@ -6,6 +6,7 @@ mod test {
 
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
     use mscheduler::tasker::task_common::ensure_index;
+
     use crate::common::test::init_collection_for_test;
 
     #[tokio::test]
@@ -49,8 +50,9 @@ mod test {
         assert!(task.params.is_some());
         assert_eq!(task.params.unwrap(), random);
         assert_eq!(task.key, key);
-        let mut send_task_option = SendTaskOption::builder().build();
-        send_task_option.update_existing_params = true;
+        let send_task_option = SendTaskOption::builder()
+            .update_existing_params(true)
+            .build();
         // reinsert task with a different parameter, but specific to update parameter
         task_producer.send_task(key, random + 1, Some(send_task_option)).await.expect("failed to send new task");
         let task = collection.find_one(doc! {"key":key}, None).await.expect("failed to find new task in db").expect("no task returns");
@@ -59,8 +61,9 @@ mod test {
         assert_eq!(task.key, key);
         // reinsert task with a different parameter, but specific to update parameter
         let run_time = DateTime::parse_rfc3339_str("2030-04-12T23:20:50.52Z").unwrap();
-        let mut send_task_option = SendTaskOption::builder().build();
-        send_task_option.run_time = Some(run_time);
+        let send_task_option = SendTaskOption::builder()
+            .run_time(Some(run_time))
+            .build();
         // reinsert task with a different run time
         let send_task_result = task_producer.send_task(key, random + 1, Some(send_task_option)).await.expect("failed to send new task");
         assert!(send_task_result.update_existing);

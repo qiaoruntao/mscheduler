@@ -27,7 +27,7 @@ pub struct SendTaskOption {
     #[builder(default = 1)]
     pub concurrency_cnt: u32,
     // do not find and do anything to a running task
-    #[builder(default = true)]
+    #[builder(default = false)]
     pub not_update_running: bool,
     #[builder(default = 30_000)]
     pub ping_interval_ms: u32,
