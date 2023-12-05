@@ -1,22 +1,28 @@
 [package]
 name = "mscheduler"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/qiaoruntao/mscheduler"
-
+publish = ["crates-io"]
+description = "Use mongodb to schedule task running"
+license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 async-trait = "0"
 mongodb = { version = "2", features = [] }
 serde = "1"
-tokio = { version = "1", features = ["signal"] }
+serde_json = "1"
+tokio = { version = "1", features = ["signal", "sync"] }
 tokio-util = { version = "0", features = ["time"] }
 tracing = { version = "0", features = ["log"] }
 futures = "0"
 strum = { version = "0", features = ["derive"] }
+hostname = { version = "0" }
+typed-builder = { version = "0" }
+log = "0.4.20"
 [dev-dependencies]
-serde_json = "1"
+#serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 env_logger = "0"
 test-log = "0"
