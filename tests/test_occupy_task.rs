@@ -5,8 +5,8 @@ mod common;
 mod test {
     use std::time::Duration;
 
-    use log::info;
     use tokio::join;
+    use tracing::info;
     use tracing::trace;
 
     use mscheduler::tasker::consumer::{ConsumerEvent, TaskConsumer, TaskConsumerConfig};
