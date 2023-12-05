@@ -63,13 +63,13 @@ mod test {
 
     use mongodb::bson::doc;
 
-    use mscheduler::tasker::consumer::{TaskConsumer, TaskConsumerConfig};
+    use mscheduler::tasker::consumer::{ConsumerEvent, TaskConsumer, TaskConsumerConfig};
     #[allow(unused_imports)]
     use mscheduler::tasker::error::MSchedulerError;
     use mscheduler::tasker::producer::{SendTaskOption, TaskProducer};
 
     use crate::{TestConsumeFailFunc, TestConsumeFunc, TestConsumeWithTimeParamFunc, TestStringConsumeFunc};
-    use crate::common::test::init_collection_for_test;
+    use crate::common::test::{init_collection_for_test, spawn_check_handler};
 
     #[test_log::test(tokio::test)]
     pub async fn test_consume_task() {
@@ -116,11 +116,13 @@ mod test {
         task_producer.send_task("111", 1, None).await.expect("failed to send task");
         tokio::time::sleep(Duration::from_secs(1)).await;
         let task = collection.find_one(doc! {"key":"111"}, None).await.expect("failed to find").expect("no task found");
-        assert_eq!(task.task_state.worker_states.len(), 1);
-        let worker_state = task.task_state.worker_states.get(0).unwrap();
-        assert_eq!(worker_state.worker_id, worker_id);
-        assert_eq!(worker_state.success_time, None);
-        assert!(worker_state.fail_time.is_some());
+        // default retry cnt is 3
+        assert_eq!(task.task_state.worker_states.len(), 3);
+        for worker_state in task.task_state.worker_states {
+            assert_eq!(worker_state.worker_id, worker_id);
+            assert_eq!(worker_state.success_time, None);
+            assert!(worker_state.fail_time.is_some());
+        }
     }
 
     #[test_log::test(tokio::test)]
@@ -289,7 +291,23 @@ mod test {
         assert_eq!(task_consumer1.get_running_task_cnt(), 1, "consumer 1 task should still be running");
         assert_eq!(task_consumer2.get_running_task_cnt(), 0, "consumer 2 should not occupy task before it finishes");
         // wait for the task to fail and consumer2 should handle it
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        let occupy_handler = spawn_check_handler(task_consumer2.clone(), |event| {
+            match event {
+                ConsumerEvent::TaskOccupyResult { .. } => { true }
+                _ => {
+                    false
+                }
+            }
+        }, Duration::from_secs(10));
+        spawn_check_handler(task_consumer1.clone(), |event| {
+            match event {
+                ConsumerEvent::TaskExecuteResult { .. } => { true }
+                _ => {
+                    false
+                }
+            }
+        }, Duration::from_secs(10)).await.expect("failed to wait for execution result").expect("failed to find result");
+        occupy_handler.await.expect("failed to wait for consumer2 occupy result").expect("failed to find consumer2 occupy");
         assert_eq!(task_consumer1.get_running_task_cnt(), 0, "no task should be running in consumer 1");
         assert_eq!(task_consumer2.get_running_task_cnt(), 1, "one task should be running in consumer 2");
     }

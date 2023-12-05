@@ -84,6 +84,7 @@ pub enum ConsumerEvent {
     },
     TaskExecuteResult {
         key: String,
+        success: bool,
     },
     /// send this event when task is marked as success
     MarkSuccess {
@@ -382,7 +383,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
                 // post processing in this thread
                 let _ = TaskConsumer::postprocess_task(state.clone(), key.clone(), &result, running_id).await;
                 // send event
-                if let Err(e) = state.consumer_event_sender.send(TaskExecuteResult { key: key.clone() }) {
+                if let Err(e) = state.consumer_event_sender.send(TaskExecuteResult { key: key.clone(), success: result.is_ok() }) {
                     error!("failed to send post process event {}",e);
                 }
                 result
