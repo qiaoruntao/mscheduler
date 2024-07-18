@@ -112,7 +112,7 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     pub async fn create(collection: Collection<Task<T, K>>, func: Func, config: TaskConsumerConfig) -> MResult<Self> {
         // TODO: magic number
         // receiver is dropped as we will spawn new in tokio::spawn
-        let (sender, _) = tokio::sync::broadcast::channel::<ConsumerEvent>(10);
+        let (sender, _) = tokio::sync::broadcast::channel::<ConsumerEvent>(2 << 6);
         let shared_consumer_state = SharedConsumerState {
             collection,
             func: Arc::new(func),
@@ -694,16 +694,19 @@ impl<T: DeserializeOwned + Send + Unpin + Sync + Clone + 'static, K: Serialize +
     async fn spawn_fetch_db(state: Arc<SharedConsumerState<T, K, Func>>) -> MResult<()> {
         trace!("spawn_fetch_db");
         let mut receiver = state.consumer_event_sender.subscribe();
-        while let Ok(consumer_event) = receiver.recv().await {
-            match consumer_event {
-                WaitOccupyQueueEmpty => {
+        loop {
+            match receiver.recv().await {
+                Ok(WaitOccupyQueueEmpty) => {
                     if state.is_fully_scanned.load(SeqCst) {
                         continue;
                     }
-                    info!("start to fetch db");
                     let _ = TaskConsumer::fetch_task(state.clone()).await;
                 }
-                _ => {}
+                Ok(_) => {}
+                Err(e) => {
+                    error!("failed to receive event {}",e);
+                    break;
+                }
             }
         }
         Ok(())
