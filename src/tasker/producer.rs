@@ -3,7 +3,7 @@ use mongodb::Collection;
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::UpdateOptions;
 use serde::Serialize;
-use tracing::{error, trace};
+use tracing::{error, instrument, trace};
 use typed_builder::TypedBuilder;
 
 use crate::tasker::error::{MResult, MSchedulerError};
@@ -55,6 +55,7 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
     }
 
     /// send a task
+    #[instrument(skip_all, fields(key=%key.as_ref()))]
     pub async fn send_task(&self, key: impl AsRef<str>, params: T, option: Option<SendTaskOption>) -> MResult<SendTaskResult> {
         let send_option = option.unwrap_or_else(|| SendTaskOption::builder().build());
         let mut query = doc! { "key": key.as_ref()};
