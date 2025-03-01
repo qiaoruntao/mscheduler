@@ -48,7 +48,7 @@ impl TaskConsumerConfig {
     }
 }
 
-pub struct SharedConsumerState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
+pub struct SharedConsumerState<T: Send + Sync, K: Send + Sync, Func: TaskConsumerFunc<T, K>> {
     collection: Collection<Task<T, K>>,
     func: Arc<Func>,
     is_fully_scanned: AtomicBool,
@@ -58,12 +58,14 @@ pub struct SharedConsumerState<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
     task_map: Mutex<HashMap<String, (JoinHandle<MResult<K>>, String)>>,
 }
 
-pub struct TaskConsumer<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> {
+pub struct TaskConsumer<T: Send + Sync, K: Send + Sync, Func: TaskConsumerFunc<T, K>> {
     marker: PhantomData<Task<T, K>>,
     state: Arc<SharedConsumerState<T, K, Func>>,
 }
 
-impl<T: Send, K: Send, Func: TaskConsumerFunc<T, K>> Clone for TaskConsumer<T, K, Func> {
+impl<T: Send + Sync, K: Send + Sync, Func: TaskConsumerFunc<T, K>> Clone
+    for TaskConsumer<T, K, Func>
+{
     fn clone(&self) -> Self {
         TaskConsumer {
             marker: Default::default(),
@@ -331,11 +333,7 @@ impl<
                 "task_state.worker_states.$.success_time":DateTime::now(),
             }
         };
-        let task = match state
-            .collection
-            .find_one_and_update(filter, update, None)
-            .await
-        {
+        let task = match state.collection.find_one_and_update(filter, update).await {
             Ok(Some(v)) => {
                 trace!("mark as success completed key={}", key.as_ref());
                 if let Err(e) = state.consumer_event_sender.send(MarkSuccess {
@@ -373,11 +371,7 @@ impl<
             }
         };
         trace!("mark_task_fail {}", &filter);
-        let task = match state
-            .collection
-            .find_one_and_update(filter, update, None)
-            .await
-        {
+        let task = match state.collection.find_one_and_update(filter, update).await {
             Ok(Some(v)) => {
                 trace!("mark as failed completed key={}", key.as_ref());
                 v
@@ -471,7 +465,7 @@ impl<
                 trace!("start to consume task now key={}", &key);
                 let result = state.func.consume(task.params).await;
                 trace!("task consumed key={}", &key);
-                // post processing in this thread
+                // post-processing in this thread
                 let _ =
                     TaskConsumer::postprocess_task(state.clone(), key.clone(), &result, running_id)
                         .await;
@@ -531,11 +525,7 @@ impl<
                 "task_state.worker_states.$.ping_expire_time":next_expire_time,
             }
         };
-        match state
-            .collection
-            .find_one_and_update(filter, update, None)
-            .await
-        {
+        match state.collection.find_one_and_update(filter, update).await {
             Ok(Some(v)) => {
                 trace!("successfully ping task key={}", &task_key);
                 Ok(v)
@@ -608,11 +598,7 @@ impl<
         }];
         let filter = doc! {"$and":all_conditions};
         trace!("updating {}", filter);
-        match state
-            .collection
-            .find_one_and_update(filter, update, None)
-            .await
-        {
+        match state.collection.find_one_and_update(filter, update).await {
             Ok(Some(v)) => {
                 trace!("successfully occupy task key={}", &task_key);
                 if let Err(e) = state.consumer_event_sender.send(TaskOccupyResult {
@@ -789,7 +775,7 @@ impl<
         ];
         let filter = doc! {"$and":all_conditions};
         trace!("fetch_task {}", &filter);
-        let mut cursor = match state.collection.find(filter, None).await {
+        let mut cursor = match state.collection.find(filter).await {
             Ok(v) => v,
             Err(e) => {
                 error!("failed to fetch more tasks {}", e);
@@ -905,7 +891,9 @@ impl<
         let mut change_stream = match state
             .collection
             .clone_with_type::<Task<T, K>>()
-            .watch(pipeline, Some(change_stream_options))
+            .watch()
+            .pipeline(pipeline)
+            .with_options(change_stream_options)
             .await
         {
             Ok(v) => v,

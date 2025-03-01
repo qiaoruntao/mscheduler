@@ -1,8 +1,8 @@
-use mongodb::{Collection, IndexModel};
 use mongodb::bson::doc;
 use mongodb::options::IndexOptions;
+use mongodb::{Collection, IndexModel};
 
-pub async fn ensure_index<T>(collection: &Collection<T>) {
+pub async fn ensure_index<T: Send + Sync>(collection: &Collection<T>) {
     let key_index = IndexModel::builder()
         .keys(doc! {"key":1})
         .options({
@@ -13,7 +13,7 @@ pub async fn ensure_index<T>(collection: &Collection<T>) {
             options
         })
         .build();
-    let _ = collection.create_index(key_index, None).await;
+    let _ = collection.create_index(key_index).await;
     let worker_id_index = IndexModel::builder()
         .keys(doc! {"key":1,"task_state.worker_states.worker_id": 1})
         .options({
@@ -24,5 +24,5 @@ pub async fn ensure_index<T>(collection: &Collection<T>) {
             options
         })
         .build();
-    let _ = collection.create_index(worker_id_index, None).await;
+    let _ = collection.create_index(worker_id_index).await;
 }

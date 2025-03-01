@@ -1,7 +1,7 @@
-use mongodb::bson::{DateTime, doc, to_bson, to_document};
-use mongodb::Collection;
+use mongodb::bson::{doc, to_bson, to_document, DateTime};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::UpdateOptions;
+use mongodb::Collection;
 use serde::Serialize;
 use tracing::{error, instrument, trace};
 use typed_builder::TypedBuilder;
@@ -9,7 +9,7 @@ use typed_builder::TypedBuilder;
 use crate::tasker::error::{MResult, MSchedulerError};
 use crate::tasker::task::{Task, TaskOption};
 
-pub struct TaskProducer<T, K> {
+pub struct TaskProducer<T: Send + Sync, K: Send + Sync> {
     task_collection: Collection<Task<T, K>>,
 }
 
@@ -47,7 +47,7 @@ pub struct SendTaskResult {
     pub update_existing: bool,
 }
 
-impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
+impl<T: Serialize + Send + Sync, K: Serialize + Send + Sync> TaskProducer<T, K> {
     pub fn create(collection: Collection<Task<T, K>>) -> MResult<TaskProducer<T, K>> {
         Ok(TaskProducer {
             task_collection: collection,
@@ -56,7 +56,12 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
 
     /// send a task
     #[instrument(skip_all, fields(key=%key.as_ref()))]
-    pub async fn send_task(&self, key: impl AsRef<str>, params: T, option: Option<SendTaskOption>) -> MResult<SendTaskResult> {
+    pub async fn send_task(
+        &self,
+        key: impl AsRef<str>,
+        params: T,
+        option: Option<SendTaskOption>,
+    ) -> MResult<SendTaskResult> {
         let send_option = option.unwrap_or_else(|| SendTaskOption::builder().build());
         let mut query = doc! { "key": key.as_ref()};
         if send_option.not_update_running {
@@ -71,7 +76,6 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
             // find a task that all worker is success or failed
             query.insert("task_state.worker_states", doc);
         }
-
 
         let now = DateTime::now();
         let start_time = send_option.run_time.clone().unwrap_or(now);
@@ -117,43 +121,50 @@ impl<T: Serialize, K: Serialize> TaskProducer<T, K> {
             }
             update_part.insert("$set", document);
         }
-        let mut update_options = UpdateOptions::default();
-        update_options.upsert = Some(true);
 
-        match self.task_collection.update_one(query, update_part, Some(update_options)).await {
+        match self
+            .task_collection
+            .update_one(query, update_part)
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+        {
             Ok(v) => {
                 if v.upserted_id.is_some() {
-                    trace!("send task and new task is created key={}",key.as_ref());
-                    Ok(SendTaskResult { insert_new: true, update_existing: false })
+                    trace!("send task and new task is created key={}", key.as_ref());
+                    Ok(SendTaskResult {
+                        insert_new: true,
+                        update_existing: false,
+                    })
                 } else if v.matched_count == 1 {
                     // TODO: check modified count
-                    trace!("send task ignored key={}",key.as_ref());
-                    Ok(SendTaskResult { insert_new: false, update_existing: true })
+                    trace!("send task ignored key={}", key.as_ref());
+                    Ok(SendTaskResult {
+                        insert_new: false,
+                        update_existing: true,
+                    })
                 } else if v.matched_count == 0 {
-                    trace!("send task is ignored key={}",key.as_ref());
+                    trace!("send task is ignored key={}", key.as_ref());
                     Err(MSchedulerError::NoTaskMatched)
                 } else {
-                    error!("send task is failed key={}",key.as_ref());
+                    error!("send task is failed key={}", key.as_ref());
                     Err(MSchedulerError::AddTaskFailed)
                 }
             }
-            Err(e) => {
-                match e.kind.as_ref() {
-                    ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
-                        if write_error.code == 11000 {
-                            trace!("task inserted failed, duplicated key");
-                            Err(MSchedulerError::DuplicatedTaskId)
-                        } else {
-                            error!("failed to send task {}",e);
-                            Err(MSchedulerError::MongoDbError(e.into()))
-                        }
-                    }
-                    _ => {
-                        error!("unknown mongodb error occurred during insert {:?}", &e);
+            Err(e) => match e.kind.as_ref() {
+                ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+                    if write_error.code == 11000 {
+                        trace!("task inserted failed, duplicated key");
+                        Err(MSchedulerError::DuplicatedTaskId)
+                    } else {
+                        error!("failed to send task {}", e);
                         Err(MSchedulerError::MongoDbError(e.into()))
                     }
                 }
-            }
+                _ => {
+                    error!("unknown mongodb error occurred during insert {:?}", &e);
+                    Err(MSchedulerError::MongoDbError(e.into()))
+                }
+            },
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "mscheduler"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 repository = "https://github.com/qiaoruntao/mscheduler"
 publish = ["crates-io"]
@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = "0"
-mongodb = { version = "2", features = [] }
+mongodb = { version = "3", features = [] }
 serde = "1"
 tokio = { version = "1", features = ["signal", "sync"] }
 tokio-util = { version = "0", features = ["time"] }
