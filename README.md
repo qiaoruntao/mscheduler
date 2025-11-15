@@ -191,7 +191,7 @@ TaskConsumer
 ## TODO
 
 -[ ] clean_success 暂不实现, maintenance
--[ ] clean_failed 暂不实现, maintenance
+-[x] clean_failed 清理失败worker, maintenance
 -[ ] detect compatibility of collection data
 -[x] auto worker id
 -[ ] 错误处理

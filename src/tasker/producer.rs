@@ -1,4 +1,4 @@
-use mongodb::bson::{doc, to_bson, to_document, DateTime};
+use mongodb::bson::{doc, to_bson, to_document, Bson, DateTime};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::UpdateOptions;
 use mongodb::Collection;
@@ -36,7 +36,8 @@ pub struct SendTaskOption {
     // clean up existing task's success worker states
     // pub clean_success: bool,
     // clean up existing task's failed worker states
-    // pub clean_failed: bool,
+    #[builder(default = false)]
+    pub clean_failed: bool,
     // TODO: more options in task_option
     #[builder(default = 60_000)]
     worker_timeout_ms: u32,
@@ -120,6 +121,24 @@ impl<T: Serialize + Send + Sync, K: Serialize + Send + Sync> TaskProducer<T, K> 
                 document.insert(update.0, update.1);
             }
             update_part.insert("$set", document);
+        }
+        if send_option.clean_failed {
+            let clean_query = query.clone();
+            let clean_update = doc! {
+                "$pull": {
+                    "task_state.worker_states": {
+                        "fail_time": {
+                            "$exists": true,
+                            "$ne": Bson::Null
+                        }
+                    }
+                }
+            };
+            // pull entries where fail_time is not null
+            if let Err(e) = self.task_collection.update_one(clean_query, clean_update).await {
+                error!("failed to clean failed worker states {}", &e);
+                return Err(MSchedulerError::MongoDbError(e.into()));
+            }
         }
 
         match self
