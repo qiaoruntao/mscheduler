@@ -14,7 +14,7 @@ pub struct TaskWorkerRunningInfo<K> {
     pub ping_expire_time: Option<DateTime>,
     // when did this task success
     pub success_time: Option<DateTime>,
-    // when did this task failed
+    // when did this task fail
     pub fail_time: Option<DateTime>,
     // fail reason
     pub fail_reason: Option<String>,

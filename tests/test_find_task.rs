@@ -48,7 +48,7 @@ mod test {
         // producer
         let task_producer = TaskProducer::create(collection2).expect("failed to create producer");
 
-        // send task
+        // send a task
         let send_task_option = SendTaskOption::builder()
             .concurrency_cnt(2_u32)
             .build();

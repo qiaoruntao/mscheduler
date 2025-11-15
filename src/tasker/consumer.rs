@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use mongodb::bson::{doc, DateTime, Document};
+use mongodb::bson::{doc, to_bson, DateTime, Document};
 use mongodb::options::{ChangeStreamOptions, FullDocumentType};
 use mongodb::Collection;
 use serde::de::DeserializeOwned;
@@ -301,8 +301,8 @@ impl<
         running_id: impl AsRef<str>,
     ) {
         match returns {
-            Ok(_) => {
-                let _ = TaskConsumer::mark_task_success(state, key, running_id).await;
+            Ok(result) => {
+                let _ = TaskConsumer::mark_task_success(state, key, running_id, Some(result)).await;
             }
             Err(_) => {
                 // make this worker retry a bit later than other workers
@@ -320,18 +320,35 @@ impl<
     }
 
     /// no need to store result
-    #[instrument(skip(state, key,running_id), fields(key = %key.as_ref(),running_id = %running_id.as_ref()))]
+    #[instrument(skip(state, key,running_id,returns), fields(key = %key.as_ref(),running_id = %running_id.as_ref()))]
     async fn mark_task_success(
         state: Arc<SharedConsumerState<T, K, Func>>,
         key: impl AsRef<str>,
         running_id: impl AsRef<str>,
+        returns: Option<&K>,
     ) -> MResult<Task<T, K>> {
-        // the filter matches specific running task.
+        // the filter matches a specific running task.
         let filter = Self::verify_matched_running_task(&state, &key, &running_id);
-        let update = doc! {
-            "$set":{
-                "task_state.worker_states.$.success_time":DateTime::now(),
+        let mut set_fields = doc! {
+            "task_state.worker_states.$.success_time":DateTime::now(),
+        };
+        if let Some(value) = returns {
+            match to_bson(value) {
+                Ok(bson_value) => {
+                    set_fields.insert("task_state.worker_states.$.returns", bson_value);
+                }
+                Err(e) => {
+                    error!(
+                        "failed to serialize task returns for key={} running_id={}: {}",
+                        key.as_ref(),
+                        running_id.as_ref(),
+                        e
+                    );
+                }
             }
+        }
+        let update = doc! {
+            "$set":set_fields
         };
         let task = match state.collection.find_one_and_update(filter, update).await {
             Ok(Some(v)) => {

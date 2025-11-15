@@ -159,7 +159,7 @@ mod test {
             // producer
             let task_producer = TaskProducer::create(collection1).expect("failed to create producer");
 
-            // send task
+            // send a task
             let send_task_option = SendTaskOption::builder().concurrency_cnt(1_u32).ping_interval_ms(1_u32).worker_timeout_ms(5_u32).build();
             // task timeout long enough
             task_producer.send_task("111", TestConsumeParam::builder().timeout_sec(100_u32).emit_error(true).build(), Some(send_task_option)).await.expect("failed to send task");
@@ -169,7 +169,7 @@ mod test {
         let worker_id1 = "aaa";
         let task_consumer1 = TaskConsumer::create(collection2, TestConsumeFunc {}, TaskConsumerConfig::builder().worker_id(worker_id1).build().clone()).await.expect("failed to create consumer");
 
-        // wait for occupy event
+        // wait for occupied event
         let occupy_handle = spawn_check_handler(task_consumer1.clone(), |event| {
             match event {
                 ConsumerEvent::TaskOccupyResult { key, success } => {

@@ -237,8 +237,7 @@ mod test {
         tokio::spawn(async move { task_consumer2.start().await });
         let task_producer =
             TaskProducer::create(collection.clone()).expect("failed to create producer");
-        let mut send_task_option = SendTaskOption::builder().build();
-        send_task_option.concurrency_cnt = 2;
+        let send_task_option = SendTaskOption::builder().concurrency_cnt(2_u32).build();
         task_producer
             .send_task("111", 1, Some(send_task_option))
             .await

@@ -1,6 +1,6 @@
 [package]
 name = "mscheduler"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 repository = "https://github.com/qiaoruntao/mscheduler"
 publish = ["crates-io"]
@@ -17,10 +17,8 @@ tokio-util = { version = "0", features = ["time"] }
 tracing = { version = "0", features = ["log"] }
 futures = "0"
 strum = { version = "0", features = ["derive"] }
-hostname = { version = "0" }
 typed-builder = { version = "0" }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }
-env_logger = "0"
 test-log = { version = "0", features = ["trace"] }
 tracing-subscriber = { version = "0", default-features = false, features = ["env-filter", "fmt"] }
