@@ -1,4 +1,4 @@
-use mongodb::bson::{doc, to_bson, to_document, Bson, DateTime};
+use mongodb::bson::{doc, serialize_to_bson, serialize_to_document, Bson, DateTime};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::UpdateOptions;
 use mongodb::Collection;
@@ -95,17 +95,17 @@ impl<T: Serialize + Send + Sync, K: Serialize + Send + Sync> TaskProducer<T, K> 
                 "task_state.create_time":now,
                 "task_state.start_time":start_time,
                 "task_state.worker_states":[],
-                "task_option":to_document(&task_option).expect("cannot convert to task_option"),
+                "task_option":serialize_to_document(&task_option).expect("cannot convert to task_option"),
             },
         };
         let mut updates = vec![];
         // decide where to put params, params can appear in either $setOnInsert or $set
         if send_option.update_existing_params {
-            updates.push(("params", to_bson(&params).unwrap()));
+            updates.push(("params", serialize_to_bson(&params).unwrap()));
         } else {
             let set_on_insert_part = update_part.get_mut("$setOnInsert").unwrap();
             let set_on_insert_doc = set_on_insert_part.as_document_mut().unwrap();
-            set_on_insert_doc.insert("params", to_bson(&params).unwrap());
+            set_on_insert_doc.insert("params", serialize_to_bson(&params).unwrap());
         }
         // update task run time if specific
         if let Some(_) = send_option.run_time {
@@ -135,7 +135,11 @@ impl<T: Serialize + Send + Sync, K: Serialize + Send + Sync> TaskProducer<T, K> 
                 }
             };
             // pull entries where fail_time is not null
-            if let Err(e) = self.task_collection.update_one(clean_query, clean_update).await {
+            if let Err(e) = self
+                .task_collection
+                .update_one(clean_query, clean_update)
+                .await
+            {
                 error!("failed to clean failed worker states {}", &e);
                 return Err(MSchedulerError::MongoDbError(e.into()));
             }

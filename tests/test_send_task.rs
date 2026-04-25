@@ -157,7 +157,7 @@ mod test {
             .update_one(
                 doc! {"key":key},
                 doc! {"$set":{
-                    "task_state.worker_states": mongodb::bson::to_bson(&worker_states).unwrap()
+                    "task_state.worker_states": mongodb::bson::serialize_to_bson(&worker_states).unwrap()
                 }},
             )
             .await

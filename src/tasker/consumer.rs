@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use mongodb::bson::{doc, to_bson, DateTime, Document};
+use mongodb::bson::{doc, serialize_to_bson, DateTime, Document};
 use mongodb::options::{ChangeStreamOptions, FullDocumentType};
 use mongodb::Collection;
 use serde::de::DeserializeOwned;
@@ -333,7 +333,7 @@ impl<
             "task_state.worker_states.$.success_time":DateTime::now(),
         };
         if let Some(value) = returns {
-            match to_bson(value) {
+            match serialize_to_bson(value) {
                 Ok(bson_value) => {
                     set_fields.insert("task_state.worker_states.$.returns", bson_value);
                 }
