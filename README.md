@@ -1,3 +1,9 @@
+> **⚠️ DEPRECATED (2026-06-16).** mscheduler is no longer used by any active
+> project and is superseded by [getitdone](https://github.com/qiaoruntao/getitdone),
+> the MongoDB-backed caller/worker task system. Do not start new work on
+> mscheduler; migrate remaining consumers to getitdone. Kept only for reference
+> and the (also-retired) `douyin_webcast_fetcher`.
+
 [//]: # ([![Crates.io][crates-badge]][crates-url])
 [![MIT licensed][mit-badge]][mit-url]
 [![Build Status][actions-badge]][actions-url]
