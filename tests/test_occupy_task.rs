@@ -5,7 +5,7 @@ mod common;
 mod test {
     use std::time::Duration;
 
-    use mongodb::bson::{doc, to_bson, DateTime};
+    use mongodb::bson::{doc, serialize_to_bson, DateTime};
     use tokio::join;
     use tracing::info;
     use tracing::trace;
@@ -349,7 +349,7 @@ mod test {
                 doc! {"key":key},
                 doc! {
                     "$set":{
-                        "task_state.worker_states": to_bson(&fail_states).expect("failed to serialize states")
+                        "task_state.worker_states": serialize_to_bson(&fail_states).expect("failed to serialize states")
                     }
                 },
             )

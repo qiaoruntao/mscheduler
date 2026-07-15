@@ -4,13 +4,13 @@ version = "0.3.1"
 edition = "2021"
 repository = "https://github.com/qiaoruntao/mscheduler"
 publish = ["crates-io"]
-description = "Use mongodb to schedule task running"
+description = "DEPRECATED (superseded by getitdone): use mongodb to schedule task running"
 license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 async-trait = "0"
-mongodb = { version = "3", features = [] }
+mongodb = { version = "=3.3.0", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver"] }
 serde = "1"
 tokio = { version = "1", features = ["signal", "sync"] }
 tokio-util = { version = "0", features = ["time"] }
